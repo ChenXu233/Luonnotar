@@ -1,0 +1,3 @@
+[submodule "vendor/fast_paddle_ocr"]
+	path = vendor/fast_paddle_ocr
+	url = https://github.com/ChenXu233/Fast-Paddle-OCR-with-NCNN.git
