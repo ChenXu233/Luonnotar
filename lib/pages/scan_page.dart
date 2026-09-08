@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:fast_paddle_ocr/ocr.dart';
 import 'package:fast_paddle_ocr/ocr_camera_view.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_svg/flutter_svg.dart';
@@ -27,6 +28,7 @@ class _ScanPageState extends State<ScanPage> with TickerProviderStateMixin {
   final _codeController = TextEditingController();
 
   Timer? _pollTimer;
+  bool _polling = false;
   OcrFrame _frame = OcrFrame.empty;
   MatchResult? _match;
 
@@ -34,6 +36,11 @@ class _ScanPageState extends State<ScanPage> with TickerProviderStateMixin {
   bool _loading = true;
   bool _cameraOpen = false;
   bool _flashOn = false;
+
+  /// 当前相机朝向：0=前置 1=后置，默认后置（前置镜像已在上层翻转）
+  int _facing = 1;
+  bool _switchingCamera = false;
+
   String _targetCode = '';
   bool _hapticFired = false;
 
@@ -59,7 +66,7 @@ class _ScanPageState extends State<ScanPage> with TickerProviderStateMixin {
     }
     try {
       await _ocr.loadModel();
-      await _ocr.openCamera();
+      await _ocr.openCamera(_facing);
       if (!mounted) return;
       setState(() {
         _loading = false;
@@ -73,8 +80,11 @@ class _ScanPageState extends State<ScanPage> with TickerProviderStateMixin {
   }
 
   void _startPolling() {
-    _pollTimer = Timer.periodic(const Duration(milliseconds: 300), (_) async {
-      if (!mounted || !_cameraOpen) return;
+    // 100ms 轮询：原生管线已去防抖全速跑，UI 刷新不能成为新瓶颈。
+    // _polling 防止上一次 channel 调用还没返回就叠加下一次。
+    _pollTimer = Timer.periodic(const Duration(milliseconds: 100), (_) async {
+      if (!mounted || !_cameraOpen || _polling) return;
+      _polling = true;
       try {
         final frame = await _ocr.pollResults();
         if (!mounted) return;
@@ -96,6 +106,8 @@ class _ScanPageState extends State<ScanPage> with TickerProviderStateMixin {
         }
       } catch (e) {
         debugPrint('poll failed: $e');
+      } finally {
+        _polling = false;
       }
     });
   }
@@ -121,6 +133,30 @@ class _ScanPageState extends State<ScanPage> with TickerProviderStateMixin {
     if (mounted) setState(() => _flashOn = on);
   }
 
+  /// 切换前后置相机：原生相机是全局单例，close 后换新朝向 reopen，
+  /// SurfaceView 与输出窗口保持不变，不需要重建平台视图。
+  Future<void> _switchCamera() async {
+    if (!_cameraOpen || _switchingCamera) return;
+    setState(() => _switchingCamera = true);
+    final next = _facing == 1 ? 0 : 1;
+    await _ocr.closeCamera();
+    final ok = await _ocr.openCamera(next);
+    if (!mounted) return;
+    if (ok) {
+      setState(() {
+        _facing = next;
+        _switchingCamera = false;
+        _flashOn = false; // 新会话的闪光灯状态已重置
+        _frame = OcrFrame.empty;
+        _match = null;
+      });
+    } else {
+      // 打开失败回滚原相机
+      await _ocr.openCamera(_facing);
+      if (mounted) setState(() => _switchingCamera = false);
+    }
+  }
+
   Future<void> _openHistory() async {
     final code = await showHistorySheet(context, _history);
     if (code != null && mounted) _selectFromHistory(code);
@@ -138,7 +174,13 @@ class _ScanPageState extends State<ScanPage> with TickerProviderStateMixin {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      body: Stack(
+      // 键盘弹出时不要让相机预览和底部工具栏跟着上浮重排，
+      // 全屏 Stack 不需要为输入法让位，避免整页 relayout 的性能浪费
+      resizeToAvoidBottomInset: false,
+      // Stack 在松散约束下会收缩到最高非定位子节点的高度，
+      // 必须用 SizedBox.expand 强制撑满，否则相机预览会被压成一条
+      body: SizedBox.expand(
+        child: Stack(
         children: [
           // 相机预览（原生渲染，含全部检测框）
           if (_cameraOpen)
@@ -304,22 +346,62 @@ class _ScanPageState extends State<ScanPage> with TickerProviderStateMixin {
                   child: Row(
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
-                      Padding(
-                        padding: const EdgeInsets.only(left: 8),
-                        child: Text(
-                          _targetCode.isEmpty
-                              ? '已识别 ${_frame.results.length} 处文字'
-                              : (_match == null
-                                  ? '正在寻找 $_targetCode …'
-                                  : '已锁定目标'),
-                          style: const TextStyle(
-                            color: FrostColors.strokeBlue,
-                            fontWeight: FontWeight.w600,
+                      Expanded(
+                        child: Padding(
+                          padding: const EdgeInsets.only(left: 8),
+                          child: Row(
+                            children: [
+                              Flexible(
+                                child: Text(
+                                  _targetCode.isEmpty
+                                      ? '已识别 ${_frame.results.length} 处文字'
+                                      : (_match == null
+                                          ? '正在寻找 $_targetCode …'
+                                          : '已锁定目标'),
+                                  overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(
+                                    color: FrostColors.strokeBlue,
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                              ),
+                              // 渲染帧率与管线耗时只在调试构建显示
+                              if (kDebugMode)
+                                Padding(
+                                  padding: const EdgeInsets.only(left: 10),
+                                  child: Text(
+                                    '${_frame.fps.toStringAsFixed(1)}FPS '
+                                    'D${_frame.detMs.toStringAsFixed(0)}/'
+                                    'R${_frame.recMs.toStringAsFixed(0)}',
+                                    style: const TextStyle(
+                                      color: FrostColors.strokeBlue,
+                                      fontSize: 12,
+                                      fontFeatures: [
+                                        FontFeature.tabularFigures()
+                                      ],
+                                    ),
+                                  ),
+                                ),
+                            ],
                           ),
                         ),
                       ),
                       Row(
                         children: [
+                          IconButton(
+                            icon: Icon(
+                              Icons.cameraswitch_outlined,
+                              color: _switchingCamera
+                                  ? FrostColors.strokeBlue
+                                      .withValues(alpha: 0.4)
+                                  : FrostColors.primary,
+                            ),
+                            tooltip: _facing == 1 ? '切换到前置' : '切换到后置',
+                            onPressed:
+                                _cameraOpen && !_switchingCamera
+                                    ? _switchCamera
+                                    : null,
+                          ),
                           IconButton(
                             icon: Icon(
                               _flashOn ? Icons.flash_on : Icons.flash_off,
@@ -343,6 +425,7 @@ class _ScanPageState extends State<ScanPage> with TickerProviderStateMixin {
             ),
           ),
         ],
+        ),
       ),
     );
   }
