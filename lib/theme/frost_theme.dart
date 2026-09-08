@@ -9,13 +9,6 @@ class FrostColors {
   /// 霜月蓝·主色
   static const primary = Color(0xFF4369C8);
 
-  /// 霜月蓝·渐变带
-  static const gradient = [
-    Color(0xFF6484D1),
-    Color(0xFF8DA4DD),
-    Color(0xFFC4D0ED),
-  ];
-
   /// 霜月白·底色
   static const background = Color(0xFFF5F9FF);
 
@@ -26,6 +19,8 @@ class FrostColors {
   static const strokeBlue = Color(0xFF7A8DC8);
 
   /// 辉光点缀（找到目标的脉冲光效）
+  /// 设计决策：界面不使用渐变填充，logo 的霜月渐变只以“外发光辉光”
+  /// 的形式出现在高亮反馈中（scan_page 的脉冲光晕用这两个色）。
   static const glowBlue = Color(0xFF3366FF);
   static const glowCyan = Color(0xFF33CCFF);
 

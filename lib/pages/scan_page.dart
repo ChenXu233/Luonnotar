@@ -223,16 +223,30 @@ class _ScanPageState extends State<ScanPage> with TickerProviderStateMixin {
                               fontWeight: FontWeight.w700,
                               letterSpacing: 2,
                               color: FrostColors.primary,
+                              fontFeatures: [FontFeature.tabularFigures()],
                             ),
                             decoration:
                                 const InputDecoration(hintText: '输入取件码 如 23-5-1234'),
                             onSubmitted: (_) => _startSearch(),
                           ),
                         ),
-                        IconButton(
-                          icon: const Icon(Icons.search,
-                              color: FrostColors.primary, size: 28),
+                        FilledButton(
+                          style: FilledButton.styleFrom(
+                            backgroundColor: FrostColors.primary,
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: 16, vertical: 10),
+                            minimumSize: Size.zero,
+                            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(16),
+                            ),
+                          ),
                           onPressed: _startSearch,
+                          child: const Text(
+                            '开始找',
+                            style: TextStyle(
+                                fontSize: 16, fontWeight: FontWeight.w700),
+                          ),
                         ),
                       ],
                     ),
