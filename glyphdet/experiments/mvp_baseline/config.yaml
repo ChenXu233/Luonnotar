@@ -1,0 +1,62 @@
+# MVP 基线：掩码条件化字形检测（全局向量 + 余弦打分头）
+seed: 42
+
+data:
+  out_dir: datasets/mvp
+  train_size: 50000
+  val_size: 1000
+  scene_size: 416
+  mask_height: 64
+  mask_width: 256
+  mask_font: "C:/Windows/Fonts/msyh.ttc"   # mask 固定雅黑
+  scene_fonts:              # 场景字体池（不含雅黑），含拉丁字体（数字/连字符多样性）
+    - "C:/Windows/Fonts/simhei.ttf"
+    - "C:/Windows/Fonts/simkai.ttf"
+    - "C:/Windows/Fonts/simfang.ttf"
+    - "C:/Windows/Fonts/simsun.ttc"
+    - "C:/Windows/Fonts/Deng.ttf"
+    - "C:/Windows/Fonts/arial.ttf"
+    - "C:/Windows/Fonts/arialbd.ttf"
+    - "C:/Windows/Fonts/cour.ttf"
+    - "C:/Windows/Fonts/consola.ttf"
+    - "C:/Windows/Fonts/impact.ttf"
+    - "C:/Windows/Fonts/verdana.ttf"
+    - "C:/Windows/Fonts/tahoma.ttf"
+    - "C:/Windows/Fonts/georgia.ttf"
+    - "C:/Windows/Fonts/times.ttf"
+    - "C:/Windows/Fonts/trebuc.ttf"
+  val_held_out_fonts:       # 验证集专用字体（训练池剔除），检验字体泛化
+    - "C:/Windows/Fonts/comic.ttf"
+    - "C:/Windows/Fonts/msjh.ttc"
+  max_texts_per_scene: 4
+  hard_neg_prob: 0.7        # 场景内含"与目标仅一位之差"干扰串的概率（首轮 AUROC 0.61 后上调）
+  target_count_range: [1, 2]
+  distractor_count_range: [0, 3]
+
+model:
+  in_size: 416
+  mask_size: [64, 256]
+  widths: [16, 32, 64, 128, 192]   # 骨干 5 级通道（nano 预算）
+  neck_ch: 96
+  mask_dim: 128
+  reg_max: 8
+  strides: [8, 16, 32]
+
+train:
+  run_name: mvp_50k_xcorr
+  epochs: 30
+  batch_size: 32
+  workers: 6
+  lr: 0.001
+  weight_decay: 0.0005
+  warmup_epochs: 3
+  loss:
+    match_weight: 1.0
+    reg_weight: 2.0
+    cen_weight: 0.5
+    hard_neg_center_weight: 3.0   # hard-neg 框中心区域的负样本加权
+
+eval:
+  score_threshold: 0.5
+  iou_threshold: 0.5
+  nms_iou: 0.4

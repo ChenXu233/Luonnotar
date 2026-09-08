@@ -1,0 +1,34 @@
+[project]
+name = "glyphdet"
+version = "0.1.0"
+description = "掩码条件化字形检测器：数据合成 + 训练 + 导出（Luonnotar 取件码检测路线 A）"
+authors = [
+    {name = "XuChenXu", email = "91937041+ChenXu233@users.noreply.github.com"},
+]
+dependencies = [
+    "torch>=2.6.0",
+    "torchvision>=0.21.0",
+    "opencv-python-headless>=4.10.0",
+    "numpy>=2.0.0",
+    "pillow>=10.0.0",
+    "pyyaml>=6.0.0",
+    "tqdm>=4.66.0",
+    "onnx>=1.17.0",
+    "onnxruntime>=1.20.0",
+    "onnxscript>=0.7.1",
+]
+requires-python = "==3.13.*"
+readme = "README.md"
+license = {text = "MIT"}
+
+[[tool.pdm.source]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+include_packages = ["torch", "torchvision"]
+exclude_packages = ["*"]
+
+[tool.pdm]
+distribution = false
+
+[tool.pdm.resolution]
+respect-source-order = true

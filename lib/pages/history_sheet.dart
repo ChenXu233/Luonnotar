@@ -117,6 +117,7 @@ class _HistorySheetState extends State<_HistorySheet> {
                             fontWeight: FontWeight.w700,
                             letterSpacing: 1.5,
                             color: FrostColors.primary,
+                            fontFeatures: [FontFeature.tabularFigures()],
                           ),
                         ),
                         subtitle: Text(

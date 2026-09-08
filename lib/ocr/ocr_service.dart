@@ -41,14 +41,19 @@ class OcrService {
       recParam: paths['PP_OCRv5_mobile_rec.ncnn.param']!,
       recModel: paths['PP_OCRv5_mobile_rec.ncnn.bin']!,
       sizeid: 0, // 320，预览分辨率下足够识别货架标签
-      cpugpu: 0, // CPU 最稳，发热已由原生限流控制
+      // CPU：实测 GPU(Vulkan) 对这套 mobile 小模型是净亏损——
+      // rec 170ms/框（CPU 40ms），det 28ms（CPU 33ms）打平，
+      // 且每次冷启动着色器编译 ~19s。小模型固定派发开销 > 计算本身。
+      cpugpu: 0,
     );
     // 取件码只含数字与连字符：白名单既解决连字符被吞，也提升准确率
     await _ocr.setCharFilter('0123456789-');
     _modelLoaded = true;
   }
 
-  Future<bool> openCamera() => _ocr.openCamera(0);
+  /// 打开相机。facing: 0=前置 1=后置（原生层约定），手机端默认后置。
+  /// 前置帧已在原生层做水平翻转，OCR 看到的文字不是镜像。
+  Future<bool> openCamera([int facing = 1]) => _ocr.openCamera(facing);
 
   Future<bool> closeCamera() => _ocr.closeCamera();
 
