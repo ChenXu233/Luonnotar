@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assert/logo.svg" alt="Luonnotar Logo" width="180">
+  <img src="docs/assert/logo.svg" alt="Luonnotar Logo" width="600">
 </p>
 
 <h1 align="center">Luonnotar · 努昂诺塔</h1>
