@@ -76,7 +76,9 @@ def compute_loss(model, scene, mask, targets, cfg):
     match_sum = torch.zeros((), device=device)
     reg_sum = torch.zeros((), device=device)
     cen_sum = torch.zeros((), device=device)
+    margin_sum = torch.zeros((), device=device)
     n_pos_total = 0
+    n_margin = 0
     for out, tgt, s in zip(outs, targets, m["strides"]):
         B, _, H, W = out.shape
         match, cen_t = tgt[:, 0], tgt[:, 5]
@@ -85,6 +87,16 @@ def compute_loss(model, scene, mask, targets, cfg):
         n_pos = int(pos.sum())
         n_pos_total += n_pos
         match_sum = match_sum + focal_sum(out[:, 0], match, weight)
+        # margin 排序损失：hard-neg 中心区(weight>1.5)最高分不得贴近正样本均分
+        # ——直接优化 AUROC/top-1 口径的点间差距，focal 只管逐点分类不管排序
+        neg_mask = (weight > 1.5) & (match < 0.5)
+        for b in range(B):
+            pb, nb = pos[b], neg_mask[b]
+            if pb.any() and nb.any():
+                margin_sum = margin_sum + F.relu(
+                    out[b, 0][nb].max() - out[b, 0][pb].mean() + lw["margin"]
+                )
+                n_margin += 1
         if n_pos:
             preg = out[:, 1 : 1 + 4 * reg_max].reshape(B, 4, reg_max, H, W)
             pred_logits = preg.permute(0, 3, 4, 1, 2)[pos]  # (n,4,reg_max)
@@ -115,10 +127,12 @@ def compute_loss(model, scene, mask, targets, cfg):
         lw["match_weight"] * match_sum / n_pos
         + lw["reg_weight"] * reg_sum / n_pos
         + lw["cen_weight"] * cen_sum / n_pos
+        + lw["margin_weight"] * margin_sum / max(n_margin, 1)
     )
     parts = dict(
         match=(match_sum / n_pos).item(), reg=(reg_sum / n_pos).item(),
-        cen=(cen_sum / n_pos).item(), n_pos=n_pos_total,
+        cen=(cen_sum / n_pos).item(), margin=(margin_sum / max(n_margin, 1)).item(),
+        n_pos=n_pos_total,
     )
     return total, parts
 
@@ -217,7 +231,7 @@ def main():
         msg = (
             f"epoch {epoch+1}/{total_epochs} loss {ep_loss/max(ep_n,1):.4f} "
             f"match {parts['match']:.4f} reg {parts['reg']:.4f} cen {parts['cen']:.4f} "
-            f"n_pos {parts['n_pos']} lr {lr_at(step):.2e} "
+            f"margin {parts['margin']:.4f} n_pos {parts['n_pos']} lr {lr_at(step):.2e} "
             f"显存 {torch.cuda.max_memory_allocated()/2**30:.1f}G "
             f"用时 {time.time()-t0:.0f}s"
         )

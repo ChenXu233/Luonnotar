@@ -5,8 +5,9 @@
         [--split both|train|val] [--n N] [--seed S] [--workers W]
 
 产出: <out_dir>/{train,val}/{scene,mask}/NNNNNN.png + labels.jsonl
-合成顺序: 程序化背景 -> 背景弹性形变 -> 文本贴片(记录四角) -> 全局透视(重投影四角)
-          -> 光度增强(不动几何)。
+合成顺序: 程序化背景 -> 背景弹性形变 -> 文本贴片(记录四角, target 完整入框+墨色极性校正)
+          -> 全局透视(重投影四角, target 四角必在图内否则重采样) -> 光度增强(不动几何)
+          -> target 可读性终检(字形 alpha 区 vs 环带灰度差 <25 级则重 roll)。
 """
 
 import argparse
@@ -57,7 +58,7 @@ def gen_code(rng):
     if k < 0.95:
         sep = str(rng.choice([" ", "", "."]))
         return sep.join([_digits(rng, 1, 3), _digits(rng, 1, 2), _digits(rng, 3, 5)])
-    n = int(rng.integers(10, 15))
+    n = int(rng.integers(10, 13))  # 长尾: 10-12 字符(真实取件码很少超 11 位)
     s = "".join(rng.choice(list(_LETTERS + _DIGITS), size=n))
     if rng.random() < 0.3:
         i = int(rng.integers(2, n - 1))
@@ -129,18 +130,22 @@ def _font(path, px):
 
 def render_mask(text, font_path, H, W):
     """mask 渲染: 固定雅黑, 整串渲染 -> 等比缩放到高 H -> 贴到 HxW 白底,
-    左对齐、垂直居中; 过宽则缩窄适配(允许轻微压扁)。黑字(0)白底(255)。"""
+    左对齐、垂直居中; 自然宽度超 W 时**等比整体缩小**(严禁单向压扁——
+    压扁的 mask 与场景目标长宽比不一致, 模板互相关必然失配)。黑字(0)白底(255)。"""
     font = _font(font_path, 96)
     bb = font.getbbox(text)
     w, h = max(1, bb[2] - bb[0]), max(1, bb[3] - bb[1])
     img = Image.new("L", (w, h), 255)
     ImageDraw.Draw(img).text((-bb[0], -bb[1]), text, font=font, fill=0)
-    nw = max(1, round(w * H / h))
-    if nw > W:
-        nw = W  # 超宽: 压扁到 W
-    img = img.resize((nw, H), Image.LANCZOS)
+    scale = H / h
+    nw = max(1, round(w * scale))
+    if nw > W:  # 超长串: 等比缩小(字高随之变小, 由多尺度模板覆盖)
+        scale = W / w
+        nw = W
+    nh = max(1, round(h * scale))
+    img = img.resize((nw, nh), Image.LANCZOS)
     canvas = Image.new("L", (W, H), 255)
-    canvas.paste(img, (0, (H - H) // 2))  # 左对齐, 垂直居中(高已为 H)
+    canvas.paste(img, (0, (H - nh) // 2))  # 左对齐, 垂直居中
     return np.array(canvas)
 
 
@@ -259,13 +264,15 @@ _DARK_INK = [(30, 30, 30), (20, 20, 60), (60, 20, 20), (20, 50, 30), (45, 45, 45
 _LIGHT_INK = [(240, 240, 240), (235, 235, 220), (250, 245, 235)]
 
 
-def render_text_patch(rng, text, font_path, ink=None):
+def render_text_patch(rng, text, font_path, ink=None, th_cap=44, polarity=None):
     """PIL 渲染文本 RGBA patch:
-    字号随机 16~44px 高; 80% 深字浅底 / 20% 浅字深底; 字距抖动 ±15%;
+    字号随机 16~th_cap px 高; 80% 深字浅底 / 20% 浅字深底(polarity 强制时除外); 字距抖动 ±15%;
     60% 在文字下垫浅色圆角矩形标签卡(可带淡边框/阴影; 浅字时卡片为深色)。
     ink 显式指定墨色(低对比训练用); None 时按分布随机。
+    polarity: "dark"/"light" 强制墨色极性(调用方按贴入处背景亮度校正用); None 时 80% 深 / 20% 浅。
+    th_cap: 字高上限, 长 target 放不下时由调用方逐轮压低。
     返回 (patch, 文本紧致矩形 (ox, oy, tw, th))。"""
-    th_target = int(rng.integers(16, 45))
+    th_target = int(rng.integers(16, th_cap + 1))
     f0 = _font(font_path, 64)
     bb = f0.getbbox(text)
     px = max(8, int(round(64 * th_target / max(1, bb[3] - bb[1]))))  # 按字高反推字号
@@ -276,10 +283,10 @@ def render_text_patch(rng, text, font_path, ink=None):
     w_text = max(8, int(math.ceil(sum(advs) + extra * (len(text) - 1))) + 2)
     layer = Image.new("RGBA", (w_text, ascent + descent), (0, 0, 0, 0))
     d = ImageDraw.Draw(layer)
-    dark = ink is None and rng.random() < 0.8
     if ink is None:
+        dark = rng.random() < 0.8 if polarity is None else (polarity == "dark")
         ink = (_DARK_INK if dark else _LIGHT_INK)[int(rng.integers(3 if not dark else len(_DARK_INK)))]
-    dark = dark or (ink is not None and sum(ink) < 384)  # 供卡片配色判断
+    dark = sum(ink) < 384  # 供卡片配色判断
     x = 1.0
     for c, a in zip(text, advs):  # 逐字排版以控制字距
         d.text((x, 0), c, font=font, fill=ink + (255,))
@@ -310,12 +317,17 @@ def render_text_patch(rng, text, font_path, ink=None):
                              outline=outline + (255,) if outline else None,
                              width=int(rng.integers(1, 3)) if outline else 1)
     patch.alpha_composite(layer, (ox, oy))
-    return patch, (ox, oy, tw, th)
+    # 纯字形 alpha(不含卡片/阴影): 终检用它定位墨迹像素——卡片的 alpha 若算进去,
+    # 量的就是"卡片 vs 背景"而不是"墨迹 vs 周边", 亮卡贴亮底会被误判不可读
+    ga = Image.new("L", (W, H), 0)
+    ga.paste(layer.split()[3], (ox, oy))
+    return patch, (ox, oy, tw, th), np.array(ga)
 
 
-def warp_patch(rng, patch, text_rect):
+def warp_patch(rng, patch, text_rect, extra=None):
     """整 patch 随机旋转 ±12° + 错切 ±0.15 (cv2.warpAffine, 透明边界)。
-    返回 (warped RGBA ndarray, 变换画布坐标系下文本四角 4x2)。"""
+    extra: 随 patch 同矩阵变换的附加单通道图(target 纯字形 alpha)。
+    返回 (warped RGBA ndarray, 变换画布坐标系下文本四角 4x2, warped_extra 或 None)。"""
     w, h = patch.size
     ang = math.radians(float(rng.uniform(-12, 12)))
     shear = float(rng.uniform(-0.15, 0.15))
@@ -330,7 +342,11 @@ def warp_patch(rng, patch, text_rect):
                             borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0, 0))
     ox, oy, tw, th = text_rect
     tc = np.array([[ox, oy], [ox + tw, oy], [ox + tw, oy + th], [ox, oy + th]], np.float64) @ A.T - mn
-    return warped, tc
+    we = None
+    if extra is not None:
+        we = cv2.warpAffine(extra, M, (out_w, out_h), flags=cv2.INTER_LINEAR,
+                            borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    return warped, tc, we
 
 
 def paste_rgba(scene, patch, px, py):
@@ -352,6 +368,18 @@ def _aabb(corners):
             float(corners[:, 0].max()), float(corners[:, 1].max())]
 
 
+def paste_alpha(acc, alpha_img, px, py):
+    """把单通道 alpha 图 max 合成进 acc(与 paste_rgba 同几何)。
+    用于累积 target 纯字形像素掩码, 供最终可读性终检定位。"""
+    S = acc.shape[0]
+    h, w = alpha_img.shape[:2]
+    x0, y0, x1, y1 = max(0, px), max(0, py), min(S, px + w), min(S, py + h)
+    if x1 <= x0 or y1 <= y0:
+        return
+    sub = alpha_img[y0 - py:y1 - py, x0 - px:x1 - px]
+    np.maximum(acc[y0:y1, x0:x1], sub, out=acc[y0:y1, x0:x1])
+
+
 def _cover_ratio(big, small):
     """small 被 big 覆盖的面积比例(用于避免文本完全遮死已有 target)。"""
     x1, y1 = max(big[0], small[0]), max(big[1], small[1])
@@ -362,17 +390,37 @@ def _cover_ratio(big, small):
 
 
 # ---------------------------------------------------------------- 几何/光度
-def perspective(rng, img, corners_list):
-    """全局透视变换(角点扰动 ≤8% 边长), 同矩阵重投影所有文本四角。"""
+def perspective(rng, img, corners_list, must_inside=(), extra_maps=()):
+    """全局透视变换(角点扰动 ≤8% 边长), 同矩阵重投影所有文本四角。
+    must_inside: 必须完整留在图内的四角组下标(target)——重采样单应矩阵
+    直到其四角全部落在 [1, S-1] 内, 8 次失败退回恒等变换(绝不截断 target)。
+    extra_maps: 随场景一起 warp 的附加单通道图(target 字形 alpha 掩码)。
+    返回 (warped_img, 重投影四角列表, warped_extra_maps 列表)。"""
     S = img.shape[0]
     m = 0.08 * S
     src = np.float32([[0, 0], [S, 0], [S, S], [0, S]])
-    dst = src + rng.uniform(-m, m, (4, 2)).astype(np.float32)
-    M = cv2.getPerspectiveTransform(src, dst)
+    M = None
+    for _ in range(8):
+        dst = src + rng.uniform(-m, m, (4, 2)).astype(np.float32)
+        cand = cv2.getPerspectiveTransform(src, dst)
+        ok = True
+        for i in must_inside:
+            c = cv2.perspectiveTransform(
+                corners_list[i].reshape(1, 4, 2).astype(np.float32), cand).reshape(4, 2)
+            if c[:, 0].min() < 1 or c[:, 1].min() < 1 or c[:, 0].max() > S - 1 or c[:, 1].max() > S - 1:
+                ok = False
+                break
+        if ok:
+            M = cand
+            break
+    if M is None:
+        M = np.eye(3, dtype=np.float32)
     warped = cv2.warpPerspective(img, M, (S, S), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
     out = [cv2.perspectiveTransform(c.reshape(1, 4, 2).astype(np.float32), M).reshape(4, 2)
            for c in corners_list]
-    return warped, out
+    maps = [cv2.warpPerspective(em, M, (S, S), flags=cv2.INTER_LINEAR,
+                                borderMode=cv2.BORDER_CONSTANT, borderValue=0) for em in extra_maps]
+    return warped, out, maps
 
 
 def _motion_kernel(ksize, angle_deg):
@@ -388,7 +436,8 @@ def photometric(rng, img, target_boxes):
     """光度增强(不动几何): 模糊/噪声/亮度对比度gamma/遮挡块/低分辨率模拟。
 
     铁律: target 必须保持人眼可读——模糊核只轻度, 遮挡块与 target 零相交(含 margin),
-    下采样不低于 0.45 倍。target 完全不可读的监督信号是白搭(用户裁定)。"""
+    下采样不低于 0.45 倍。但本函数只约束单个算子的烈度, 复合效果(如 gamma 压暗低对比
+    文字)由 build_sample 第 6 步的可读性终检在最终像素上兜底。"""
     S = img.shape[0]
     if rng.random() < 0.4:  # 轻度高斯模糊或运动模糊(人眼必须仍可读)
         if rng.random() < 0.5:
@@ -431,8 +480,19 @@ def photometric(rng, img, target_boxes):
 
 
 # ---------------------------------------------------------------- 样本组装
+REJECT = {}  # 拒绝原因计数(调测插桩, 不消耗 rng, 不影响确定性)
+DELTAS = []  # 通过 target 的终检实测差值 + 构造信息 (delta, low_contrast, bg_mean, bg_std, fallback)
+FAILS = []   # 失败 target 同上(记录最后一次光度尝试的差值)
+LAST_FAIL = None  # 最近一张终检失败的 (scene, target_boxes, delta), 供外部 dump 目检
+
+
+def _rej(reason):
+    REJECT[reason] = REJECT.get(reason, 0) + 1
+    return None
+
+
 def build_sample(rng, cfg, scene_fonts):
-    """合成一张样本; target 全部丢失时返回 None(交由上层重 roll)。"""
+    """合成一张样本; target 全部丢失/不可读时返回 None(交由上层重 roll, 原因计入 REJECT)。"""
     S = cfg["scene_size"]
     query = gen_code(rng)
     # 文本清单: 1~2 个 target(同一 query 多处出现) + 0~3 干扰(可选 hard negative)
@@ -455,45 +515,101 @@ def build_sample(rng, cfg, scene_fonts):
             texts.append([s, 0])
     # 1) 背景  2) 弹性形变(仅背景)
     scene = elastic(rng, gen_background(rng, S))
-    # 3) 文本贴片(target 严禁被遮挡: 任何新文本覆盖已有 target 面积 >15% 即重试位置;
-    #    15% 概率使用与背景接近的低对比墨色——真实低可读场景, 但人眼仍可辨)
+    # 3) 文本贴片(target 严禁被遮挡/截断/不可读: 任何新文本覆盖已有 target 面积 >15%
+    #    即重试位置; target 贴片必须完整入框(留 PLACE_M 边距), 框内容不下则逐轮压低字高重渲;
+    #    target 按贴入处背景亮度校正墨色极性(或低对比), 重渲后重新钳位、入框优先;
+    #    干扰串允许出图截断(真实负样本), 但覆盖已有干扰 >60% 也重试(避免叠成浆糊))
+    PLACE_M = 0.03 * S
+    FIT = S - 2 * PLACE_M - 2  # target 贴片可放下的最大宽/高(留 2px 取整余量)
     placed = []  # (文本四角 scene 坐标 4x2, is_target)
     boxes = []   # 已贴文本的轴对齐包围盒
+    talphas = []  # 每个 target 的字形 alpha 掩码(供光度后的可读性终检)
+    tinfo = []   # 每个 target 的构造信息 (low_contrast, bg_mean, bg_std), 调测用
     for text, is_t in texts:
         fp = scene_fonts[int(rng.integers(len(scene_fonts)))]
         low_contrast = rng.random() < 0.15
-        patch, rect = render_text_patch(rng, text, fp)
-        warped, tc = warp_patch(rng, patch, rect)
-        ph, pw = warped.shape[:2]
+        th_cap = 44
+        for _ in range(8):  # target 必须能完整入框: 放不下就压低字高重渲
+            patch, rect, ga = render_text_patch(rng, text, fp, th_cap=th_cap)
+            warped, tc, gaw = warp_patch(rng, patch, rect, extra=ga if is_t else None)
+            ph, pw = warped.shape[:2]
+            if not is_t or (pw <= FIT and ph <= FIT):
+                break
+            th_cap = max(10, int(th_cap * 0.75))
+        else:
+            continue  # 极端长串压到 10px 仍超宽, 放弃该 target
         ok = False
         px = py = 0
         bb = None
+        tcmn, tcmx = tc.min(0), tc.max(0)
         for _ in range(10):
-            px = int(rng.uniform(0.08 * S, 0.92 * S) - pw / 2)
-            py = int(rng.uniform(0.08 * S, 0.92 * S) - ph / 2)
+            if is_t:  # target 完整入框: 位置采样区间由四角跨度反推, 并 clip 回合法范围
+                lo_x, hi_x = PLACE_M - tcmn[0], S - PLACE_M - tcmx[0]
+                lo_y, hi_y = PLACE_M - tcmn[1], S - PLACE_M - tcmx[1]
+                px = int(np.clip(round(rng.uniform(lo_x, hi_x)), math.ceil(lo_x), math.floor(hi_x)))
+                py = int(np.clip(round(rng.uniform(lo_y, hi_y)), math.ceil(lo_y), math.floor(hi_y)))
+            else:
+                px = int(rng.uniform(0.08 * S, 0.92 * S) - pw / 2)
+                py = int(rng.uniform(0.08 * S, 0.92 * S) - ph / 2)
             bb = _aabb(tc + [px, py])
-            if not any(t == 1 and _cover_ratio(bb, ob) > 0.15 for ob, t in boxes):
+            if not any(_cover_ratio(bb, ob) > (0.15 if t == 1 else 0.6) for ob, t in boxes):
                 ok = True
                 break
         if not ok:
             continue  # 位置重试失败, 放弃该文本
-        if low_contrast:  # 取贴入位置的背景均值, 墨色 = 背景 ± [25,85] 亮度差
+        # target 墨色按贴入处背景校正: 亮底深字/暗底亮字(正常), 或背景 ±[35,95](低对比);
+        # 干扰串仅低对比路径(不做极性校正, 不可读的干扰无害)
+        bgm = bgs = None
+        fb = False  # 极性校正重渲 4 轮不入框退回原始渲染的标记(调测用)
+        if is_t or low_contrast:
             x1, y1 = max(0, int(bb[0])), max(0, int(bb[1]))
             x2, y2 = min(S, int(bb[2]) + 1), min(S, int(bb[3]) + 1)
             if x2 > x1 and y2 > y1:
                 mean = scene[y1:y2, x1:x2].reshape(-1, 3).mean(0)
-                sign = -1.0 if mean.mean() > 128 else 1.0
-                ink = tuple(int(v) for v in np.clip(mean + sign * rng.uniform(25, 85, 3), 0, 255))
-                patch, rect = render_text_patch(rng, text, fp, ink=ink)
-                warped, tc = warp_patch(rng, patch, rect)
+                bgm, bgs = float(mean.mean()), float(scene[y1:y2, x1:x2].std())
+                if low_contrast:
+                    sign = -1.0 if mean.mean() > 128 else 1.0
+                    ink = tuple(int(v) for v in np.clip(mean + sign * rng.uniform(35, 95, 3), 0, 255))
+                    kw = dict(ink=ink)
+                else:
+                    kw = dict(polarity="dark" if mean.mean() > 128 else "light")
+                if is_t:  # 校正重渲后尺寸会变: 压低字高重试至入框(最多 4 轮), 绝不退回随机极性
+                    fb = True
+                    for _ in range(4):
+                        patch2, rect2, ga2 = render_text_patch(rng, text, fp, th_cap=th_cap, **kw)
+                        warped2, tc2, gaw2 = warp_patch(rng, patch2, rect2, extra=ga2)
+                        tcmn2, tcmx2 = tc2.min(0), tc2.max(0)
+                        lo_x, hi_x = PLACE_M - tcmn2[0], S - PLACE_M - tcmx2[0]
+                        lo_y, hi_y = PLACE_M - tcmn2[1], S - PLACE_M - tcmx2[1]
+                        if math.ceil(lo_x) <= math.floor(hi_x) and math.ceil(lo_y) <= math.floor(hi_y):
+                            px = int(np.clip(px, math.ceil(lo_x), math.floor(hi_x)))
+                            py = int(np.clip(py, math.ceil(lo_y), math.floor(hi_y)))
+                            patch, warped, tc = patch2, warped2, tc2
+                            gaw = gaw2
+                            fb = False
+                            break
+                        th_cap = max(10, int(th_cap * 0.85))
+                    # 4 轮仍不入框(极罕见) -> 保持原样, 由终检门兜底
+                else:
+                    patch2, rect2, _ = render_text_patch(rng, text, fp, th_cap=th_cap, **kw)
+                    warped2, tc2, _ = warp_patch(rng, patch2, rect2)
+                    patch, warped, tc = patch2, warped2, tc2
                 bb = _aabb(tc + [px, py])
         paste_rgba(scene, warped, px, py)
         placed.append((tc + [px, py], is_t))
         boxes.append((bb, is_t))
+        if is_t:
+            ta = np.zeros((S, S), np.uint8)
+            paste_alpha(ta, gaw, px, py)
+            talphas.append(ta)
+            tinfo.append((low_contrast, bgm, bgs, fb))
     if not any(t == 1 for _, t in placed):
-        return None
-    # 4) 全局透视 + 重投影四角 -> 包围盒 clip; 过小/出图则丢弃该标注
-    scene, tcs = perspective(rng, scene, [c for c, _ in placed])
+        return _rej("no_target_placed")
+    # 4) 全局透视 + 重投影四角 -> 包围盒 clip; target 由透视重采样保证完整留图,
+    #    干扰串出图部分被 clip; 过小/出图则丢弃该标注
+    scene, tcs, talphas = perspective(rng, scene, [c for c, _ in placed],
+                                      must_inside=[i for i, (_, t) in enumerate(placed) if t == 1],
+                                      extra_maps=talphas)
     out_boxes, out_flags = [], []
     for corners, (_, is_t) in zip(tcs, placed):
         x1, y1, x2, y2 = _aabb(corners)
@@ -504,9 +620,40 @@ def build_sample(rng, cfg, scene_fonts):
         out_boxes.append([x1, y1, x2, y2])
         out_flags.append(is_t)
     if not any(f == 1 for f in out_flags):
-        return None  # target 全丢 -> 上层重 roll
-    # 5) 光度增强(遮挡块与 target 零相交; 模糊/低采样保持人眼可读)
-    scene = photometric(rng, scene, [b for b, f in zip(out_boxes, out_flags) if f == 1])
+        return _rej("target_lost_in_perspective")
+    # 5)+6) 光度增强 + target 可读性终检(联合重 roll): 终检在最终像素上量每个 target 的
+    #    字形 alpha 区与外圈 4px 环带灰度均值差, <25 级即人眼不可辨。薄笔画被模糊/低采样
+    #    抹掉是光度参数的锅, 不该连累整样本——终检不过就换一组光度参数重来(最多 6 组),
+    #    仍不过才整样重 roll(终检门仍是兜底: 任何环节把 target 搞瞎都出不去)。
+    tboxes = [b for b, f in zip(out_boxes, out_flags) if f == 1]
+    pre = scene
+    bad = "gate_low_delta"
+    for _ in range(6):
+        scene = photometric(rng, pre.copy(), tboxes)
+        gray = cv2.cvtColor(scene, cv2.COLOR_RGB2GRAY).astype(np.float32)
+        deltas = []
+        bad = None
+        for ta, info in zip(talphas, tinfo):
+            g = ta > 128
+            if not g.any():
+                bad = "gate_alpha_gone"  # 字形像素完全丢失(理论不该发生)
+                break
+            ring = (cv2.dilate(ta, np.ones((9, 9), np.uint8)) > 128) & ~g
+            if not ring.any():
+                bad = "gate_no_ring"
+                break
+            delta = abs(float(gray[g].mean()) - float(gray[ring].mean()))
+            if delta < 25.0:
+                FAILS.append((delta,) + info)
+                globals()["LAST_FAIL"] = (scene.copy(), list(tboxes), delta)
+                bad = "gate_low_delta"
+                break
+            deltas.append((delta,) + info)
+        if bad is None:
+            DELTAS.extend(deltas)
+            break
+    if bad is not None:
+        return _rej(bad)
     # mask: 整串 query 标准渲染
     mask = render_mask(query, cfg["mask_font"], cfg["mask_height"], cfg["mask_width"])
     return query, mask, scene, out_boxes, out_flags
@@ -516,7 +663,8 @@ def gen_one(task):
     """多进程 worker: 生成单张样本并写盘, 返回 labels.jsonl 记录。"""
     rng = np.random.default_rng([task["seed"], task["split_tag"], task["idx"]])
     result = None
-    for _ in range(8):  # target 全丢时重 roll(同一 rng 继续, 保持确定性)
+    for _ in range(64):  # target 全丢/不可读时重 roll(同一 rng 继续, 保持确定性);
+        # 单次拒绝率 ~35%, 8 次上限在 50k 规模下必撞(0.35^8×50k≈11 次), 放宽到 64
         result = build_sample(rng, task["cfg"], task["fonts"])
         if result is not None:
             break

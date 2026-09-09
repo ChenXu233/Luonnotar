@@ -1,15 +1,16 @@
-# MVP 基线：掩码条件化字形检测（全局向量 + 余弦打分头）
+# mask 长宽比修正实验：mask 384 宽 + 超长串等比缩小（不压扁）+ 模板尺度适配
+# 基于 mvp_baseline/config.yaml，仅改 out_dir/run_name/mask 尺寸/模板尺度
 seed: 42
 
 data:
-  out_dir: datasets/mvp
+  out_dir: datasets/mvp2
   train_size: 50000
   val_size: 1000
   scene_size: 416
   mask_height: 64
-  mask_width: 384              # 384 宽容纳长码自然长宽比（旧 256 会压扁长码，已证有害）
-  mask_font: "C:/Windows/Fonts/msyh.ttc"   # mask 固定雅黑
-  scene_fonts:              # 场景字体池（不含雅黑），30 款覆盖 sans/serif/mono 字形空间
+  mask_width: 384
+  mask_font: "C:/Windows/Fonts/msyh.ttc"
+  scene_fonts:
     - "C:/Windows/Fonts/simhei.ttf"
     - "C:/Windows/Fonts/simkai.ttf"
     - "C:/Windows/Fonts/simfang.ttf"
@@ -50,25 +51,25 @@ data:
     - "C:/Windows/Fonts/LeelawUI.ttf"
     - "C:/Windows/Fonts/taile.ttf"
     - "C:/Windows/Fonts/javatext.ttf"
-  val_held_out_fonts:       # 验证集专用字体（训练池剔除），检验字体泛化
+  val_held_out_fonts:
     - "C:/Windows/Fonts/comic.ttf"
     - "C:/Windows/Fonts/msjh.ttc"
   max_texts_per_scene: 4
-  hard_neg_prob: 0.7        # 场景内含"与目标仅一位之差"干扰串的概率（首轮 AUROC 0.61 后上调）
+  hard_neg_prob: 0.7
   target_count_range: [1, 2]
   distractor_count_range: [0, 3]
 
 model:
   in_size: 416
   mask_size: [64, 384]
-  widths: [16, 32, 64, 128, 192]   # 骨干 5 级通道（nano 预算）
+  widths: [16, 32, 64, 128, 192]
   neck_ch: 96
   mask_dim: 128
   reg_max: 8
   strides: [8, 16, 32]
 
 train:
-  run_name: mvp_f39_e45_margin
+  run_name: mvp_maskfix
   epochs: 45
   batch_size: 32
   workers: 6
@@ -79,9 +80,9 @@ train:
     match_weight: 1.0
     reg_weight: 2.0
     cen_weight: 0.5
-    margin_weight: 0.5            # margin 排序损失权重（直接优化 AUROC/top-1）
-    margin: 2.0                 # logit 间隔（α≈10 尺度下 ≈ 0.2 余弦差）
-    hard_neg_center_weight: 3.0   # hard-neg 框中心区域的负样本加权
+    margin_weight: 0.5
+    margin: 2.0
+    hard_neg_center_weight: 3.0
 
 eval:
   score_threshold: 0.5
