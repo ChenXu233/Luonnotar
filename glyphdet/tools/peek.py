@@ -46,7 +46,7 @@ def main():
                 cv2.rectangle(scene, (x1, y1), (x2, y2), (0, 0, 230), 1)
         mask = cv2.cvtColor(imread(d / rec["mask"], cv2.IMREAD_GRAYSCALE), cv2.COLOR_GRAY2BGR)
         h = scene.shape[0]
-        panel = np.full((h, 280, 3), 255, np.uint8)  # 左侧面板: mask + query
+        panel = np.full((h, max(280, mask.shape[1] + 24), 3), 255, np.uint8)  # 左侧面板: mask + query
         mh, mw = mask.shape[:2]
         panel[8:8 + mh, 12:12 + mw] = mask
         cv2.putText(panel, "Q:" + rec["query"], (12, 8 + mh + 34),

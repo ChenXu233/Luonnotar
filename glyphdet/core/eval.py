@@ -76,8 +76,11 @@ def main():
 
     val = GlyphDataset(Path(cfg["data"]["out_dir"]) / "val")
     n_hit = n_target = 0
+    n_hit_iou03 = 0
     n_pred = n_pred_wrong = 0
+    n_top1_hit = 0  # 每张图最高分预测框命中 target(IoU≥0.5) 的图数（App 只高亮最优匹配）
     tgt_scores, neg_scores = [], []  # target 框内最高分 vs 干扰/hard-neg 框内最高分
+    thr_sweep = {t: [0, 0, 0] for t in (0.3, 0.4, 0.5, 0.6)}  # thr -> [hit, pred, wrong]
     vis_dir = Path(args.weights).parent / "vis"
     vis_dir.mkdir(parents=True, exist_ok=True)
 
@@ -97,16 +100,34 @@ def main():
         gt_n = boxes_np[tgt <= 0.5]
         gt_t = gt_t[gt_t.sum(1) > 0]
         gt_n = gt_n[gt_n.sum(1) > 0]
-        # 检出 / 误检
+        # 检出 / 误检（主阈值）
         n_target += len(gt_t)
         if len(pb):
             iou_t = iou_matrix(pb, gt_t)
             for j in range(len(gt_t)):
                 if (iou_t[:, j] >= ec["iou_threshold"]).any():
                     n_hit += 1
+                if (iou_t[:, j] >= 0.3).any():  # 宽 IoU：分离"没检出"与"框不准"
+                    n_hit_iou03 += 1
             wrong = (iou_t.max(1) < 0.3) if len(gt_t) else np.ones(len(pb), bool)
             n_pred += len(pb)
             n_pred_wrong += int(wrong.sum())
+            # top-1：最高分框是否命中任一 target
+            top = int(np.argmax(ps))
+            if len(gt_t) and iou_t[top].max() >= ec["iou_threshold"]:
+                n_top1_hit += 1
+        # 阈值扫描（同一批 outs 用不同阈值重 decode，仅统计）
+        for t in thr_sweep:
+            pb2, _ = decode_outputs(
+                outs, m["strides"], m["reg_max"], score_thr=t, nms_iou=ec["nms_iou"],
+            )
+            if not len(pb2):
+                continue
+            iou2 = iou_matrix(pb2, gt_t)
+            thr_sweep[t][0] += int(sum((iou2[:, j] >= ec["iou_threshold"]).any() for j in range(len(gt_t))))
+            wrong2 = (iou2.max(1) < 0.3) if len(gt_t) else np.ones(len(pb2), bool)
+            thr_sweep[t][1] += len(pb2)
+            thr_sweep[t][2] += int(wrong2.sum())
         # 一位之差可分性：框内最高分（三级 sigmoid 分数图插值回原图后取逐点 max）
         maps = []
         for out in outs:
@@ -140,10 +161,19 @@ def main():
         "weights": args.weights,
         "n_val": len(val),
         "recall@thr%.2f_iou%.2f" % (ec["score_threshold"], ec["iou_threshold"]): round(recall, 4),
+        "recall_iou0.3": round(n_hit_iou03 / max(n_target, 1), 4),
         "pred_fp_rate": round(fp_rate, 4),
+        "top1_acc": round(n_top1_hit / max(len(val), 1), 4),
         "one_char_auroc": round(auroc(tgt_scores, neg_scores), 4),
         "tgt_score_mean": round(float(np.mean(tgt_scores)), 4) if tgt_scores else None,
         "neg_score_mean": round(float(np.mean(neg_scores)), 4) if neg_scores else None,
+        "thr_sweep": {
+            str(t): {
+                "recall": round(v[0] / max(n_target, 1), 4),
+                "fp_rate": round(v[2] / max(v[1], 1), 4),
+            }
+            for t, v in thr_sweep.items()
+        },
         "infer_ms_gpu_avg": round(t_infer / max(len(val), 1) * 1000, 2),
     }
     # CPU 耗时（端侧参考下限）

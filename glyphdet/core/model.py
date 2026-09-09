@@ -174,8 +174,8 @@ class Head(nn.Module):
     输出通道布局 [score_logit(1), reg_dfl(4*reg_max), centerness(1)]。
     """
 
-    # 模板缩放目标 (h, w)：覆盖场景字高 16-48px（stride 8 下 2-6 格）
-    TPL_SCALES = ((2, 8), (3, 12), (4, 16), (6, 24))
+    # 模板缩放目标 (h, w)：模板原生 8×48（mask 384 宽），覆盖场景字高 16-48px
+    TPL_SCALES = ((2, 12), (3, 18), (4, 24), (6, 36))
 
     def __init__(self, c=96, wdim=128, reg_max=8, tpl_ch=48):
         super().__init__()
@@ -253,7 +253,7 @@ if __name__ == "__main__":
     n = count_params(net)
     print(f"参数量: {n/1e6:.2f}M（fp16 约 {n*2/1e6:.1f}MB）")
     scene = torch.rand(1, 3, 416, 416)
-    mask = torch.rand(1, 1, 64, 256)
+    mask = torch.rand(1, 1, 64, 384)
     with torch.no_grad():
         outs = net(scene, mask)
     for s, o in zip(cfg["model"]["strides"], outs):
