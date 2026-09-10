@@ -18,7 +18,10 @@ def dfl_expect(reg, reg_max):
 
 
 @torch.no_grad()
-def decode_outputs(outs, strides, reg_max, score_thr=0.5, nms_iou=0.4, max_det=20):
+def decode_outputs(
+    outs, strides, reg_max,
+    score_thr: float = 0.5, nms_iou: float = 0.4, max_det: int = 20,
+) -> tuple["np.ndarray", "np.ndarray"]:
     """单张图的裸输出 → (boxes xyxy numpy, scores numpy)。输入为 list of (1,C,H,W)。"""
     all_boxes, all_scores = [], []
     for out, s in zip(outs, strides):

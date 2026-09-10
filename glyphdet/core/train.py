@@ -19,7 +19,7 @@ from torch.utils.data import DataLoader
 
 from glyphdet.core.dataset import GlyphDataset
 from glyphdet.core.decode import dfl_expect
-from glyphdet.core.model import GlyphDet, count_params
+from glyphdet.core.model import GlyphDet, build_model, count_params
 
 
 def focal_sum(logit, target, weight, alpha=0.25, gamma=2.0):
@@ -161,7 +161,7 @@ def main():
     tc = cfg["train"]
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = GlyphDet(cfg).to(device)
+    model = build_model(cfg).to(device)
     print(f"设备: {device}，参数量 {count_params(model)/1e6:.2f}M")
 
     root = Path(cfg["data"]["out_dir"])

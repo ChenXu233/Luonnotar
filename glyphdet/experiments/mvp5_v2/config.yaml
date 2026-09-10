@@ -1,0 +1,103 @@
+# v7：GlyphDet v2 架构 A/B——同数据（datasets/mvp4 v6 配方），只换架构。
+# 对照基线 = v1 在同数据的终局：AUROC 0.9351 / top1 0.885 / recall 0.8612 / fp 0.097。
+# v2 三刀：① 砍 stride32 死重，匹配下沉 P2(stride4)（P2 核盖 16~24px、P3 核盖 32~64px）
+#         ② RepVGG 训练期多分支（导出时 fuse 回单 3×3）+ SE 注意力
+#         ③ 层级分配按字高（不再 maxd——极端宽高比下小字长串被错配到粗级别）
+seed: 42
+
+data:
+  out_dir: datasets/mvp4
+  train_size: 100000
+  val_size: 1000
+  scene_size: 416
+  mask_height: 64
+  mask_width: 384
+  mask_font: "C:/Windows/Fonts/msyh.ttc"
+  mask_fonts:
+    - "C:/Windows/Fonts/msyh.ttc"
+    - "C:/Windows/Fonts/arial.ttf"
+    - "C:/Windows/Fonts/segoeui.ttf"
+    - "C:/Windows/Fonts/calibri.ttf"
+    - "C:/Windows/Fonts/tahoma.ttf"
+    - "C:/Windows/Fonts/verdana.ttf"
+  scene_fonts:
+    - "C:/Windows/Fonts/simhei.ttf"
+    - "C:/Windows/Fonts/simkai.ttf"
+    - "C:/Windows/Fonts/simfang.ttf"
+    - "C:/Windows/Fonts/simsun.ttc"
+    - "C:/Windows/Fonts/Deng.ttf"
+    - "C:/Windows/Fonts/arial.ttf"
+    - "C:/Windows/Fonts/arialbd.ttf"
+    - "C:/Windows/Fonts/ARIALN.TTF"
+    - "C:/Windows/Fonts/ariblk.ttf"
+    - "C:/Windows/Fonts/bahnschrift.ttf"
+    - "C:/Windows/Fonts/calibri.ttf"
+    - "C:/Windows/Fonts/calibrib.ttf"
+    - "C:/Windows/Fonts/cambria.ttc"
+    - "C:/Windows/Fonts/candara.ttf"
+    - "C:/Windows/Fonts/candarab.ttf"
+    - "C:/Windows/Fonts/corbel.ttf"
+    - "C:/Windows/Fonts/corbelb.ttf"
+    - "C:/Windows/Fonts/consola.ttf"
+    - "C:/Windows/Fonts/consolab.ttf"
+    - "C:/Windows/Fonts/cour.ttf"
+    - "C:/Windows/Fonts/courbd.ttf"
+    - "C:/Windows/Fonts/FRamd.ttf"
+    - "C:/Windows/Fonts/GOTHIC.TTF"
+    - "C:/Windows/Fonts/GOTHICB.TTF"
+    - "C:/Windows/Fonts/BKANT.TTF"
+    - "C:/Windows/Fonts/GARA.TTF"
+    - "C:/Windows/Fonts/GARABD.TTF"
+    - "C:/Windows/Fonts/impact.ttf"
+    - "C:/Windows/Fonts/micross.ttf"
+    - "C:/Windows/Fonts/segoeui.ttf"
+    - "C:/Windows/Fonts/segoeuib.ttf"
+    - "C:/Windows/Fonts/verdana.ttf"
+    - "C:/Windows/Fonts/tahoma.ttf"
+    - "C:/Windows/Fonts/georgia.ttf"
+    - "C:/Windows/Fonts/times.ttf"
+    - "C:/Windows/Fonts/trebuc.ttf"
+    - "C:/Windows/Fonts/trebucbd.ttf"
+    - "C:/Windows/Fonts/LeelawUI.ttf"
+    - "C:/Windows/Fonts/taile.ttf"
+    - "C:/Windows/Fonts/javatext.ttf"
+  val_held_out_fonts:
+    - "C:/Windows/Fonts/comic.ttf"
+    - "C:/Windows/Fonts/msjh.ttc"
+  max_texts_per_scene: 4
+  hard_neg_prob: 0.7
+  hard_neg_count_range: [1, 2]
+  target_count_range: [1, 2]
+  distractor_count_range: [0, 3]
+
+model:
+  arch: v2
+  in_size: 416
+  mask_size: [64, 384]
+  widths: [24, 48, 96, 160]
+  neck_ch: 96
+  mask_dim: 128
+  reg_max: 8
+  strides: [4, 8, 16]
+  assign: height
+
+train:
+  run_name: mvp_v2
+  epochs: 40
+  batch_size: 16
+  workers: 6
+  lr: 0.001
+  weight_decay: 0.0005
+  warmup_epochs: 3
+  loss:
+    match_weight: 1.0
+    reg_weight: 2.0
+    cen_weight: 0.5
+    margin_weight: 0.5
+    margin: 2.0
+    hard_neg_center_weight: 3.0
+
+eval:
+  score_threshold: 0.5
+  iou_threshold: 0.5
+  nms_iou: 0.4

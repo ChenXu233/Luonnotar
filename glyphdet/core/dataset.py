@@ -24,6 +24,9 @@ from torch.utils.data import Dataset
 MAX_BOXES = 8
 # 每级回归范围（像素，max(l,t,r,b)），FCOS 惯例
 LEVEL_RANGES = {8: (0, 64), 16: (64, 128), 32: (128, 1e9)}
+# v2 按字高分配：字高窄带 16~64px 每级一个倍频程；宽度交给大核宽兜底。
+# v1 的 maxd 分配在极端宽高比下 maxd≈半宽，小字长串会被错配到粗级别
+LEVEL_RANGES_H = {4: (0, 28), 8: (28, 56), 16: (56, 1e9)}
 CENTER_SHRINK = 0.25
 
 
@@ -39,8 +42,10 @@ def imread_chw(path, gray=False):
     return torch.from_numpy(img[None] if gray else img.transpose(2, 0, 1))
 
 
-def build_targets(boxes, is_target, strides, in_size, reg_max, hard_neg_w):
-    """boxes: (N,4) numpy xyxy；返回 list of (8,H,W) numpy。"""
+def build_targets(boxes, is_target, strides, in_size, reg_max, hard_neg_w,
+                  assign="maxd"):
+    """boxes: (N,4) numpy xyxy；返回 list of (8,H,W) numpy。
+    assign: "maxd"(v1, FCOS 按最大边分配) / "height"(v2, 按字高分配)。"""
     outs = []
     for s in strides:
         hw = in_size // s
@@ -52,7 +57,7 @@ def build_targets(boxes, is_target, strides, in_size, reg_max, hard_neg_w):
         cen = np.zeros((hw, hw), np.float32)
         pos = np.zeros((hw, hw), np.float32)
         assigned_area = np.full((hw, hw), 1e18, np.float32)
-        lo, hi = LEVEL_RANGES[s]
+        lo, hi = (LEVEL_RANGES_H if assign == "height" else LEVEL_RANGES)[s]
         for j in range(len(boxes)):
             x1, y1, x2, y2 = boxes[j]
             if x2 <= x1 or y2 <= y1:
@@ -66,7 +71,10 @@ def build_targets(boxes, is_target, strides, in_size, reg_max, hard_neg_w):
             cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
             hbw, hbh = (x2 - x1) * CENTER_SHRINK, (y2 - y1) * CENTER_SHRINK
             in_center = (np.abs(gx - cx) < hbw) & (np.abs(gy - cy) < hbh)
-            in_range = (maxd >= lo) & (maxd < hi)
+            if assign == "height":  # 按字高（标量）分配级别，广播到网格
+                in_range = np.full((hw, hw), lo <= (y2 - y1) < hi, bool)
+            else:
+                in_range = (maxd >= lo) & (maxd < hi)
             if is_target[j] > 0.5:
                 cand = in_center & in_range & (area < assigned_area)
                 if not cand.any():
@@ -99,7 +107,7 @@ def build_targets(boxes, is_target, strides, in_size, reg_max, hard_neg_w):
 
 
 class GlyphDataset(Dataset):
-    def __init__(self, root, cfg=None):
+    def __init__(self, root, cfg: dict | None = None):
         """cfg 为 None 时返回裸 boxes（评估用）；否则返回预分配 targets（训练用）。"""
         self.root = Path(root)
         self.cfg = cfg
@@ -109,7 +117,7 @@ class GlyphDataset(Dataset):
     def __len__(self):
         return len(self.rows)
 
-    def __getitem__(self, i):
+    def __getitem__(self, i: int):
         row = self.rows[i]
         scene = imread_chw(self.root / row["scene"])
         mask = imread_chw(self.root / row["mask"], gray=True)
@@ -125,6 +133,7 @@ class GlyphDataset(Dataset):
         targets = build_targets(
             boxes, is_target, m["strides"], m["in_size"], m["reg_max"],
             self.cfg["train"]["loss"]["hard_neg_center_weight"],
+            m.get("assign", "maxd"),
         )
         return scene, mask, [torch.from_numpy(t) for t in targets]
 

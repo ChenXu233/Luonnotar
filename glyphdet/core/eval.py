@@ -22,7 +22,7 @@ import yaml
 
 from glyphdet.core.dataset import GlyphDataset, imread_chw
 from glyphdet.core.decode import decode_outputs
-from glyphdet.core.model import GlyphDet
+from glyphdet.core.model import GlyphDet, build_model
 
 
 def iou_matrix(a, b):
@@ -70,7 +70,7 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     ckpt = torch.load(args.weights, map_location="cpu", weights_only=False)
-    model = GlyphDet(cfg)
+    model = build_model(cfg)
     model.load_state_dict(ckpt["model"])
     model.eval().to(device)
 

@@ -26,6 +26,13 @@
 - thr_sweep：阈值 0.3 时 recall 0.9296/fp 0.0911 —— 降阈值能换 recall 但 fp 更差，印证"低阈值+时序积分"路线必须以压 fp 为前提。
 - **下一步**：fppeek（tools/fppeek.py，新建）分解 fp 成分（distr 干扰串型 vs bg 背景型）+ failpeek 重跑，给用户人工判定后定配方：对抗负样本（同字体/同卡 hard-neg）vs 类文字背景纹理。
 
+## 2026-09-10 v6（hardneg）终局裁决 + v2 架构 A/B 开火
+
+- **mvp_100k_hardneg 终 eval（ep40，lineage val）**：AUROC 0.9351 / top1 0.885 / recall 0.8612 / fp 0.097 / GPU 13.54ms——**全面低于 maskaug 终局（0.9508/0.923/0.9001/0.0833）**。v6 数据杠杆（同字体同卡 hard-neg 加量）在 v1 架构上收益为负：判别预算被更难的训练负样本耗尽，held-out 字体轴被挤垮。**架构天花板实锤，像素/匹配粒度问题必须架构解**。
+- **v2 已实现并冒烟通过**（GlyphDetV2，experiments/mvp5_v2）：① 砍 stride32 死重（P5 占 ~40% 参数却对 16~48px 字高带无贡献），匹配下沉 P2(stride4)——P2 核 (4,24)/(6,36) 盖 16~24px、P3 核 (4,24)/(6,36)/(8,48) 盖 32~64px，10 字符长串每字符 3.6 列（v1 仅 1.2 列）；② RepVGG 训练期三分支、导出 fuse 回单 3×3（fuse 等价 diff ~1e-6）+ SE 注意力；③ 层级分配按字高 {4:(0,28),8:(28,56),16:(56,∞)}（修 v1 maxd 在极端宽高比下把小字长串错配到粗级别的暗伤）。**参数 2.47M→fuse 2.39M vs v1 3.36M（-27%）**。
+- **A/B 设计**：同数据 datasets/mvp4（v6 配方，零重合成），v1 基线 0.9351/0.885/0.8612/0.097。run=mvp_v2 40ep 后台训练中。
+- 用户判断背书：像素传递（骨干早降采样斩笔画）与 RepVGG 类重参数化一起解决；假设"架构对了之后泛化不再依赖数据堆量"——本轮 A/B 即验证。
+
 ## 2026-09-10 fppeek/failpeek 裁决（终局权重，val 前 300 张）
 
 - **fp 成分：39/39 全是 distr 型（框住干扰串），0 个背景型** → 类文字背景纹理路线砍掉，对抗负样本是唯一方向（用户预判正确）。
@@ -68,8 +75,19 @@
 
 ## 进行中
 
-- **无后台任务**。mvp_100k_maskaug（40ep）已训完并终 eval（见上）。（历史：margin 实验在 ep18 中期裁决后杀掉让 GPU；mvp2 v5 数据、maskfix 45ep 均已完结。）
-- 待用户人工判定：docs/failreview/（maskfix 时代 16 张漏检，未回收判定）；新一轮 fppeek/failpeek 出图后一并判定。
+- **mvp_v2 训练 40ep bs16**（后台 bash-5f28sm4n，20:09 首启 bs32 因显存 7.2G/8G 顶到交换区被杀，20:4x 以 bs16 重启，重启后 5.6G 安全水位；lr 未动——bs 32→16 在容忍范围内，保 A/B 配方可比）：A/B 同数据 datasets/mvp4，v1 基线 0.9351/0.885/0.8612/0.097。P2 级使 epoch 比 v1（13.6min）长且 bs 减半，估 25~35min/epoch，40ep ≈ 17~23h。训完：终 eval 对比基线 → fppeek 复看近邻串分数 → 达标则 export_onnx（v2 已内置 reparam 融合）。
+- 待用户人工判定：docs/failreview/（maskfix 时代 16 张漏检，未回收判定）、docs/fpreview/fppeek.png 与 docs/fpreview/fppeek_hardneg_ep29.png（fp 特写，已自查全 distr 型）。
+
+## 二期设计共识（用户讨论沉淀，2026-09-10）
+
+**总线：检测非识别、两阶段、时序积分、像素预算只花在刀刃上。**
+
+1. **时序层（不改模型，纯推理期逻辑，住插件层）**：逐帧检测 + IoU 关联成 track + k-of-n 滑窗积分确认（单帧 recall 0.9 → 4 帧中 2 ≈ 0.996，随机 fp 空间一致性被杀）+ 运动门控（IMU/帧差，模糊帧降权）+ 确认后切 ROI 锁定跟踪（裁小图推理 ~5ms，帧率跑满，丢失回全帧）。decode 阈值插件可配（建议 0.15~0.2 低阈值跑高 recall，fp 交给时序层）。自回归/多帧网络均否掉（无序列解码结构、破 40ms 帧预算、训练数据代价大）；空间稳定型高分 fp（近邻串）时序层杀不掉，必须数据/模型层压。
+2. **1080p 物理账**：模型入口 416²，训练字高分布 16~44px。整帧 1080p→416 缩放比 0.217，40cm 手持 1cm 字（≈34px@1080p）只剩 7px——整帧缩放必死。正解：相机层数码变焦（SCALER crop，免费）+ 原生分辨率 ROI 裁切；UX 预期管理（太远就提示靠近/自动放大）。判别必须发生在笔画分得开的原生像素上。
+3. **两阶段架构（用户提出虚拟类别）**：stage-1 = TextProposal 提案网（摘掉 mask 条件的单类检测器："这里像不像一串字"，类别无关 objectness；~0.2-0.4M 参数、208²~416² 输入、1~3ms NPU，25fps 常驻；KPI=recall@topK，精度交给 stage-2）；stage-2 = GlyphDet 只吃原生分辨率 ROI（416 letterbox），永远在训练分布内。标签白拿：现有合成数据所有文本框 is_target 全置 1 重打包。stage-1 用 CRAFT 字符级 textness 路线（文献证据：textness 泛化比判别泛化容易，但需字符级粒度而非纯纹理）。
+4. **stage-1 分辨率可变**（用户坚持）：全卷积+FPN → ONNX 动态输入轴 320/416/608/832 按场景/帧率选档；训练用 YOLO 式随机输入尺寸一套权重通吃；synth 的 stage-1 训练分布字高下探 6~10px（stage-2 维持 16px 下沿=判别物理极限）。
+5. **文献锚点**：任务本体=query-by-string word spotting（Wang CVPR'21 联合检测+相似度；PHOC 谱系——mask 模板本质可学习 PHOC）；stage-2 近亲=OS2D/CoAE one-shot 模板匹配检测 + SiamRPN 系 xcorr；stage-1 近亲=CRAFT/EAST/DBNet。DeepSeek 视觉三代（VL2 动态 tiling、OCR/DeepEncoder 先局部后压缩再全局、2026 视觉基元 CSA）核心教训：**分辨率预算只花在刀刃上，空间压缩绝不进判别路径**；一套权重多分辨率原生训练可抄。
+6. **骨干参数效率路线**（用户拍板）：RepVGG 重参数化（训练多分支/导出融合零成本）+ SE + 深阶段深度可分离 + 参数向 P2/P3 集中——v2 已落地前两条，深阶段 DW 留作后续。单位参数智能超 ResNet-50 那代设计是行业常态（MobileNetV3 证据），非野心。
 
 ## 已确认的修正（按用户裁定）
 

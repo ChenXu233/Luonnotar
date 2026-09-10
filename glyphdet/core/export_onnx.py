@@ -15,7 +15,7 @@ import onnxruntime as ort
 import torch
 import yaml
 
-from glyphdet.core.model import GlyphDet
+from glyphdet.core.model import GlyphDet, build_model
 
 
 def main():
@@ -26,10 +26,12 @@ def main():
     args = ap.parse_args()
     cfg = yaml.safe_load(open(args.config, encoding="utf-8"))
 
-    model = GlyphDet(cfg).eval()
+    model = build_model(cfg).eval()
     if args.weights:
         ckpt = torch.load(args.weights, map_location="cpu", weights_only=False)
         model.load_state_dict(ckpt["model"])
+    if hasattr(model, "reparam"):
+        model.reparam()  # v2: RepVGG 训练分支融合回单 3×3 卷积（导出/部署形态）
     out_path = args.out or str(Path(args.weights or ".").with_name("glyphdet.onnx"))
 
     scene = torch.rand(1, 3, cfg["model"]["in_size"], cfg["model"]["in_size"])

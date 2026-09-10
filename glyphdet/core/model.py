@@ -238,6 +238,198 @@ def count_params(model):
     return sum(p.numel() for p in model.parameters())
 
 
+# ============================================================ v2：像素流重构
+# 三个像素死亡点修复：① P5(stride32) 死重砍掉，匹配下沉到 P2(stride4)；
+# ② 模板核不再整体压扁——P2 核 (4,24)/(6,36) 盖 16~24px 小字，P3 核
+# (4,24)/(6,36)/(8,48) 盖 32~64px 大字，逐字符列数翻倍；
+# ③ RepVGG 训练期多分支、导出期融合回单 3×3（零成本增容量）+ SE 注意力。
+# 字高窄带 16~64px 专配：每级覆盖一个倍频程，宽长串由大核宽兜底。
+
+
+class SE(nn.Module):
+    """Squeeze-Excitation 通道注意力（参数 ~2c²/r，几乎免费）。"""
+
+    def __init__(self, c, r=8):
+        super().__init__()
+        self.fc1 = nn.Conv2d(c, max(4, c // r), 1)
+        self.fc2 = nn.Conv2d(max(4, c // r), c, 1)
+
+    def forward(self, x):
+        s = F.adaptive_avg_pool2d(x, 1)
+        return x * torch.sigmoid(self.fc2(F.silu(self.fc1(s))))
+
+
+class RepVGGBlock(nn.Module):
+    """RepVGG 块：训练期 3×3+1×1+identity 三分支，fuse() 后等价单 3×3 卷积。"""
+
+    def __init__(self, c):
+        super().__init__()
+        self.b3 = nn.Sequential(nn.Conv2d(c, c, 3, 1, 1, bias=False), nn.BatchNorm2d(c))
+        self.b1 = nn.Sequential(nn.Conv2d(c, c, 1, 1, 0, bias=False), nn.BatchNorm2d(c))
+        self.bid = nn.BatchNorm2d(c)
+
+    def forward(self, x):
+        return F.silu(self.b3(x) + self.b1(x) + self.bid(x))
+
+    @staticmethod
+    def _fuse_conv_bn(conv, bn):
+        w = conv.weight
+        std = (bn.running_var + bn.eps).sqrt()
+        scale = bn.weight / std
+        return w * scale[:, None, None, None], bn.bias - bn.running_mean * scale
+
+    def fuse(self):
+        """返回等价的 nn.Sequential(conv3x3, SiLU)（部署形态）。"""
+        w3, b3 = self._fuse_conv_bn(self.b3[0], self.b3[1])
+        w1, b1 = self._fuse_conv_bn(self.b1[0], self.b1[1])
+        # identity 分支 = 每通道 delta 核的 1×1 卷积
+        c = self.b3[0].weight.shape[0]
+        wid = torch.zeros(c, c, 1, 1, device=w3.device, dtype=w3.dtype)
+        wid[torch.arange(c), torch.arange(c), 0, 0] = 1.0
+        std = (self.bid.running_var + self.bid.eps).sqrt()
+        scale = self.bid.weight / std
+        bid = self.bid.bias - self.bid.running_mean * scale
+        w = w3 + F.pad(w1, (1, 1, 1, 1)) + F.pad(wid * scale[:, None, None, None], (1, 1, 1, 1))
+        b = b3 + b1 + bid
+        conv = nn.Conv2d(c, c, 3, 1, 1, bias=True)
+        conv.weight.data.copy_(w)
+        conv.bias.data.copy_(b)
+        return nn.Sequential(conv, nn.SiLU())
+
+
+class BackboneV2(nn.Module):
+    """v2 骨干：stride 2/4/8/16 四级（砍掉 stride32 死重），RepVGG 块 + SE 收尾。"""
+
+    def __init__(self, widths=(24, 48, 96, 160), depths=(1, 2, 2, 2)):
+        super().__init__()
+        assert len(widths) == 4 and len(depths) == 4
+        self.stem = nn.Sequential(
+            ConvBNAct(3, widths[0], 3, 2), RepVGGBlock(widths[0])  # stride 2
+        )
+        stages = []
+        for i in range(1, 4):
+            layers = [ConvBNAct(widths[i - 1], widths[i], 3, 2)]
+            layers += [RepVGGBlock(widths[i]) for _ in range(depths[i])]
+            layers.append(SE(widths[i]))
+            stages.append(nn.Sequential(*layers))
+        self.stages = nn.ModuleList(stages)  # stride 4/8/16
+
+    def forward(self, x):
+        x = self.stem(x)
+        outs = []
+        for st in self.stages:
+            x = st(x)
+            outs.append(x)
+        return outs  # P2(s4), P3(s8), P4(s16)
+
+
+class NeckV2(nn.Module):
+    """P2/P3/P4 自顶向下 FPN + 每级 FiLM 条件化。"""
+
+    def __init__(self, in_chs=(48, 96, 160), c=96, wdim=128):
+        super().__init__()
+        self.lat2 = nn.Conv2d(in_chs[0], c, 1, bias=False)
+        self.lat3 = nn.Conv2d(in_chs[1], c, 1, bias=False)
+        self.lat4 = nn.Conv2d(in_chs[2], c, 1, bias=False)
+        self.film2, self.film3, self.film4 = FiLM(wdim, c), FiLM(wdim, c), FiLM(wdim, c)
+        self.fuse2, self.fuse3, self.fuse4 = BasicBlock(c), BasicBlock(c), BasicBlock(c)
+
+    def forward(self, p2, p3, p4, w):
+        x4 = self.film4(self.lat4(p4), w)
+        x3 = self.film3(self.lat3(p3) + F.interpolate(x4, scale_factor=2, mode="nearest"), w)
+        x2 = self.film2(self.lat2(p2) + F.interpolate(x3, scale_factor=2, mode="nearest"), w)
+        return self.fuse2(x2), self.fuse3(x3), self.fuse4(x4)
+
+
+class HeadV2(nn.Module):
+    """v2 头：P2/P3 两级做模板互相关（P2 盖小字、P3 盖大字），P4 仅余弦粗分。
+
+    模板核不再整串压扁：P2 (4,24)/(6,36) → 字高 16/24px；P3 (4,24)/(6,36)/(8,48)
+    → 字高 32/48/64px。10 字符长串在 (6,36) 下每字符 3.6 列（v1 (2,12) 仅 1.2 列）。
+    输出通道布局同 v1：[score_logit(1), reg_dfl(4*reg_max), centerness(1)]。"""
+
+    XCORR_SCALES = {0: ((4, 24), (6, 36)), 1: ((4, 24), (6, 36), (8, 48))}
+
+    def __init__(self, c=96, wdim=128, reg_max=8, tpl_ch=48):
+        super().__init__()
+        self.reg_max = reg_max
+        self.wdim = wdim
+        self.proj = nn.Conv2d(c, wdim, 1)
+        self.corr_proj = nn.Conv2d(c, tpl_ch, 1)
+        self.fuse = nn.ModuleDict(  # 每级：cos + k 个相关图 → logit
+            {str(i): nn.Conv2d(1 + len(k), 1, 1) for i, k in self.XCORR_SCALES.items()}
+        )
+        self.fuse_p4 = nn.Conv2d(1, 1, 1)
+        self.alpha = nn.Parameter(torch.tensor(10.0))
+        self.beta = nn.Parameter(torch.tensor(-3.0))
+        self.reg_convs = nn.ModuleList(ConvBNAct(c, c) for _ in range(3))
+        self.reg_out = nn.ModuleList(
+            nn.Conv2d(c, 4 * reg_max + 1, 1) for _ in range(3)
+        )
+
+    def forward(self, feats, w, tpl):
+        wn = F.normalize(w, dim=1).view(w.size(0), self.wdim, 1, 1)
+        outs = []
+        for i, f in enumerate(feats):
+            e = F.normalize(self.proj(f), dim=1)
+            cos_map = (e * wn).sum(1, keepdim=True) * self.alpha + self.beta
+            if i in self.XCORR_SCALES:
+                s_feat = self.corr_proj(f)
+                rs = [cos_map]
+                for sh, sw in self.XCORR_SCALES[i]:
+                    t = F.interpolate(tpl, size=(sh, sw), mode="bilinear", align_corners=False)
+                    rs.append(xcorr_same(s_feat, t).unsqueeze(1))
+                score = self.fuse[str(i)](torch.cat(rs, 1))
+            else:
+                score = self.fuse_p4(cos_map)
+            r = self.reg_out[i](self.reg_convs[i](f))
+            outs.append(torch.cat([score, r], 1))
+        return outs
+
+
+class GlyphDetV2(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        m = cfg["model"]
+        widths = tuple(m["widths"])
+        tpl_ch = m.get("tpl_ch", 48)
+        self.backbone = BackboneV2(widths=widths)
+        self.mask_enc = MaskEncoder(mask_dim=m["mask_dim"], tpl_ch=tpl_ch)
+        self.neck = NeckV2(
+            in_chs=(widths[1], widths[2], widths[3]), c=m["neck_ch"], wdim=m["mask_dim"]
+        )
+        self.head = HeadV2(
+            c=m["neck_ch"], wdim=m["mask_dim"], reg_max=m["reg_max"], tpl_ch=tpl_ch
+        )
+        self.reg_max = m["reg_max"]
+        self.strides = m["strides"]
+
+    def forward(self, scene, mask):
+        w, tpl = self.mask_enc(mask)
+        p2, p3, p4 = self.backbone(scene)
+        return self.head(self.neck(p2, p3, p4, w), w, tpl)
+
+    def reparam(self):
+        """导出前调用：所有 RepVGGBlock 原地替换为融合后的部署形态。"""
+        for name, mod in list(self.named_modules()):
+            if isinstance(mod, RepVGGBlock):
+                parent = self
+                *path, attr = name.split(".")
+                for p in path:
+                    parent = getattr(parent, p) if not p.isdigit() else parent[int(p)]
+                if attr.isdigit():
+                    parent[int(attr)] = mod.fuse()
+                else:
+                    setattr(parent, attr, mod.fuse())
+
+
+def build_model(cfg):
+    """按 cfg["model"]["arch"] 构造模型（缺省 v1，向后兼容）。"""
+    if cfg["model"].get("arch") == "v2":
+        return GlyphDetV2(cfg)
+    return GlyphDet(cfg)
+
+
 if __name__ == "__main__":
     # 自检：随机输入前向 + 参数量 + ONNX 导出试跑
     cfg = {
