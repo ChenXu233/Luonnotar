@@ -20,9 +20,9 @@ import numpy as np
 import torch
 import yaml
 
-from dataset import GlyphDataset, imread_chw
-from decode import decode_outputs
-from model import GlyphDet
+from glyphdet.core.dataset import GlyphDataset, imread_chw
+from glyphdet.core.decode import decode_outputs
+from glyphdet.core.model import GlyphDet
 
 
 def iou_matrix(a, b):

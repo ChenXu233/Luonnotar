@@ -4,7 +4,6 @@
 """
 
 import argparse
-import sys
 from pathlib import Path
 
 import cv2
@@ -12,11 +11,10 @@ import numpy as np
 import torch
 import yaml
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "core"))
-from dataset import GlyphDataset
-from decode import decode_outputs
-from eval import iou_matrix
-from model import GlyphDet
+from glyphdet.core.dataset import GlyphDataset
+from glyphdet.core.decode import decode_outputs
+from glyphdet.core.eval import iou_matrix
+from glyphdet.core.model import GlyphDet
 
 
 def main():

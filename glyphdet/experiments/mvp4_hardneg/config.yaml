@@ -1,0 +1,99 @@
+# v6 配方：fppeek 裁决后——fp 100% 是干扰串型高分误检（一位之差/同数字重分段），
+# 每场景显式注入 1~2 个 hard-neg（同字体/同卡片/同墨色极性 + 形近对加权 + 30% 二次扰动）。
+# 基于 mvp3_100k/config.yaml，仅改 out_dir/run_name/hard_neg_count_range，其余不动保口径。
+seed: 42
+
+data:
+  out_dir: datasets/mvp4
+  train_size: 100000
+  val_size: 1000
+  scene_size: 416
+  mask_height: 64
+  mask_width: 384
+  mask_font: "C:/Windows/Fonts/msyh.ttc"
+  mask_fonts:
+    - "C:/Windows/Fonts/msyh.ttc"
+    - "C:/Windows/Fonts/arial.ttf"
+    - "C:/Windows/Fonts/segoeui.ttf"
+    - "C:/Windows/Fonts/calibri.ttf"
+    - "C:/Windows/Fonts/tahoma.ttf"
+    - "C:/Windows/Fonts/verdana.ttf"
+  scene_fonts:
+    - "C:/Windows/Fonts/simhei.ttf"
+    - "C:/Windows/Fonts/simkai.ttf"
+    - "C:/Windows/Fonts/simfang.ttf"
+    - "C:/Windows/Fonts/simsun.ttc"
+    - "C:/Windows/Fonts/Deng.ttf"
+    - "C:/Windows/Fonts/arial.ttf"
+    - "C:/Windows/Fonts/arialbd.ttf"
+    - "C:/Windows/Fonts/ARIALN.TTF"
+    - "C:/Windows/Fonts/ariblk.ttf"
+    - "C:/Windows/Fonts/bahnschrift.ttf"
+    - "C:/Windows/Fonts/calibri.ttf"
+    - "C:/Windows/Fonts/calibrib.ttf"
+    - "C:/Windows/Fonts/cambria.ttc"
+    - "C:/Windows/Fonts/candara.ttf"
+    - "C:/Windows/Fonts/candarab.ttf"
+    - "C:/Windows/Fonts/corbel.ttf"
+    - "C:/Windows/Fonts/corbelb.ttf"
+    - "C:/Windows/Fonts/consola.ttf"
+    - "C:/Windows/Fonts/consolab.ttf"
+    - "C:/Windows/Fonts/cour.ttf"
+    - "C:/Windows/Fonts/courbd.ttf"
+    - "C:/Windows/Fonts/FRamd.ttf"
+    - "C:/Windows/Fonts/GOTHIC.TTF"
+    - "C:/Windows/Fonts/GOTHICB.TTF"
+    - "C:/Windows/Fonts/BKANT.TTF"
+    - "C:/Windows/Fonts/GARA.TTF"
+    - "C:/Windows/Fonts/GARABD.TTF"
+    - "C:/Windows/Fonts/impact.ttf"
+    - "C:/Windows/Fonts/micross.ttf"
+    - "C:/Windows/Fonts/segoeui.ttf"
+    - "C:/Windows/Fonts/segoeuib.ttf"
+    - "C:/Windows/Fonts/verdana.ttf"
+    - "C:/Windows/Fonts/tahoma.ttf"
+    - "C:/Windows/Fonts/georgia.ttf"
+    - "C:/Windows/Fonts/times.ttf"
+    - "C:/Windows/Fonts/trebuc.ttf"
+    - "C:/Windows/Fonts/trebucbd.ttf"
+    - "C:/Windows/Fonts/LeelawUI.ttf"
+    - "C:/Windows/Fonts/taile.ttf"
+    - "C:/Windows/Fonts/javatext.ttf"
+  val_held_out_fonts:
+    - "C:/Windows/Fonts/comic.ttf"
+    - "C:/Windows/Fonts/msjh.ttc"
+  max_texts_per_scene: 4
+  hard_neg_prob: 0.7          # 旧键保留(装载兼容), 被 hard_neg_count_range 覆盖
+  hard_neg_count_range: [1, 2]  # v6: 每场景 1~2 个 hard-neg(同字体同卡近邻串)
+  target_count_range: [1, 2]
+  distractor_count_range: [0, 3]
+
+model:
+  in_size: 416
+  mask_size: [64, 384]
+  widths: [16, 32, 64, 128, 192]
+  neck_ch: 96
+  mask_dim: 128
+  reg_max: 8
+  strides: [8, 16, 32]
+
+train:
+  run_name: mvp_100k_hardneg
+  epochs: 40
+  batch_size: 32
+  workers: 6
+  lr: 0.001
+  weight_decay: 0.0005
+  warmup_epochs: 3
+  loss:
+    match_weight: 1.0
+    reg_weight: 2.0
+    cen_weight: 0.5
+    margin_weight: 0.5
+    margin: 2.0
+    hard_neg_center_weight: 3.0
+
+eval:
+  score_threshold: 0.5
+  iou_threshold: 0.5
+  nms_iou: 0.4

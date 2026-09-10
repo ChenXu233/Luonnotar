@@ -83,8 +83,13 @@ def gen_distractor(rng):
     return "".join(rng.choice(list(_LETTERS), size=n))
 
 
-def hard_negative(rng, s):
-    """与 query 仅一个字符不同: 替换/增删一位, 或连字符位置移动一位。"""
+# 形近数字对(fppeek 实锤的一位之差误检按此加权): 0/8/6 闭环、1/7、3/8/5、5/6、6/9/0、8/9 等
+_CONFUSE = {"0": "86", "1": "7", "2": "7", "3": "85", "4": "9", "5": "68",
+            "6": "509", "7": "1", "8": "0369", "9": "864"}
+
+
+def _one_mutation(rng, s):
+    """单次扰动: 替换(数字 60% 走形近对)/增/删一位, 或连字符移位 1~2 格。"""
     n = len(s)
     cands = ["sub", "ins"] + (["del"] if n >= 4 else []) + (["hyphen"] if "-" in s else [])
     op = cands[int(rng.integers(len(cands)))]
@@ -92,7 +97,10 @@ def hard_negative(rng, s):
         i = int(rng.integers(n))
         ch = s[i]
         if ch.isdigit():
-            pool = [c for c in _DIGITS if c != ch]
+            if rng.random() < 0.6 and ch in _CONFUSE:
+                pool = list(_CONFUSE[ch])
+            else:
+                pool = [c for c in _DIGITS if c != ch]
         elif ch.isalpha():
             pool = [c for c in _LETTERS if c != ch]
         else:  # 分隔符替换为另一种分隔符
@@ -102,18 +110,33 @@ def hard_negative(rng, s):
         i = int(rng.integers(n + 1))
         return s[:i] + _DIGITS[int(rng.integers(len(_DIGITS)))] + s[i:]
     if op == "del":
-        i = int(rng.integers(n))
+        # 删掉夹在两个连字符中间的字符会造出 "--"(不真实), 避开这些位置
+        cand = [i for i in range(n)
+                if s[i] == "-" or not (0 < i < n - 1 and s[i - 1] == "-" and s[i + 1] == "-")]
+        i = cand[int(rng.integers(len(cand)))]
         return s[:i] + s[i + 1:]
-    # hyphen: 摘一个连字符, 移位一格重新插入(避开与原位置/其他连字符相邻)
+    # hyphen: 摘一个连字符, 移位 1~2 格重新插入(避开与原位置/其他连字符相邻);
+    # 实锤误检模式即此: 9-77-62674 vs 97-7-62674、47-95-8384 vs 479-5-8384(同数字重分段)
     hy = [i for i, c in enumerate(s) if c == "-"]
     i = hy[int(rng.integers(len(hy)))]
     s2 = s[:i] + s[i + 1:]
-    js = [j for j in (i - 1, i + 1) if 1 <= j <= len(s2) - 1
+    js = [j for j in (i - 2, i - 1, i + 1, i + 2) if 1 <= j <= len(s2) - 1
           and s2[j - 1] != "-" and s2[j] != "-"]
     if not js:
-        return hard_negative(rng, s2)  # 退化时换一种扰动
+        return _one_mutation(rng, s2)  # 退化时换一种扰动
     j = js[int(rng.integers(len(js)))]
     return s2[:j] + "-" + s2[j:]
+
+
+def hard_negative(rng, s):
+    """与 query 近邻的对抗串: 一次扰动为主, 30% 再叠一次(覆盖 8049 vs 81449 这类
+    "换一位+少一位"的实锤误检); 二次扰动若退化回 query 则放弃第二次。"""
+    out = _one_mutation(rng, s)
+    if rng.random() < 0.3:
+        out2 = _one_mutation(rng, out)
+        if out2 != s:
+            out = out2
+    return out
 
 
 # ---------------------------------------------------------------- 字体与渲染
@@ -128,15 +151,21 @@ def _font(path, px):
     return _FONT_CACHE[key]
 
 
-def render_mask(text, font_path, H, W):
-    """mask 渲染: 固定雅黑, 整串渲染 -> 等比缩放到高 H -> 贴到 HxW 白底,
+def render_mask(text, font_path, H, W, rng=None, font_pool=None):
+    """mask 渲染: 整串渲染 -> 等比缩放到高 H -> 贴到 HxW 白底,
     左对齐、垂直居中; 自然宽度超 W 时**等比整体缩小**(严禁单向压扁——
-    压扁的 mask 与场景目标长宽比不一致, 模板互相关必然失配)。黑字(0)白底(255)。"""
+    压扁的 mask 与场景目标长宽比不一致, 模板互相关必然失配)。黑字(0)白底(255)。
+    font_pool 非空时按 rng 随机抽字体 + 30% 加粗描边(字重抖动)——迫使模板匹配
+    对 mask 字体不变(部署侧 mask 字体由 App 渲染, 与训练字体不同属域漂)。"""
+    stroke = 0
+    if font_pool and rng is not None:
+        font_path = font_pool[int(rng.integers(len(font_pool)))]
+        stroke = 1 if rng.random() < 0.3 else 0
     font = _font(font_path, 96)
-    bb = font.getbbox(text)
+    bb = font.getbbox(text, stroke_width=stroke)
     w, h = max(1, bb[2] - bb[0]), max(1, bb[3] - bb[1])
     img = Image.new("L", (w, h), 255)
-    ImageDraw.Draw(img).text((-bb[0], -bb[1]), text, font=font, fill=0)
+    ImageDraw.Draw(img).text((-bb[0], -bb[1]), text, font=font, fill=0, stroke_width=stroke)
     scale = H / h
     nw = max(1, round(w * scale))
     if nw > W:  # 超长串: 等比缩小(字高随之变小, 由多尺度模板覆盖)
@@ -264,12 +293,13 @@ _DARK_INK = [(30, 30, 30), (20, 20, 60), (60, 20, 20), (20, 50, 30), (45, 45, 45
 _LIGHT_INK = [(240, 240, 240), (235, 235, 220), (250, 245, 235)]
 
 
-def render_text_patch(rng, text, font_path, ink=None, th_cap=44, polarity=None):
+def render_text_patch(rng, text, font_path, ink=None, th_cap=44, polarity=None, card=None):
     """PIL 渲染文本 RGBA patch:
     字号随机 16~th_cap px 高; 80% 深字浅底 / 20% 浅字深底(polarity 强制时除外); 字距抖动 ±15%;
     60% 在文字下垫浅色圆角矩形标签卡(可带淡边框/阴影; 浅字时卡片为深色)。
     ink 显式指定墨色(低对比训练用); None 时按分布随机。
     polarity: "dark"/"light" 强制墨色极性(调用方按贴入处背景亮度校正用); None 时 80% 深 / 20% 浅。
+    card: True/False 强制是否垫标签卡(hard-neg 与 target 对齐卡片样式用); None 时 60% 随机。
     th_cap: 字高上限, 长 target 放不下时由调用方逐轮压低。
     返回 (patch, 文本紧致矩形 (ox, oy, tw, th))。"""
     th_target = int(rng.integers(16, th_cap + 1))
@@ -293,7 +323,7 @@ def render_text_patch(rng, text, font_path, ink=None, th_cap=44, polarity=None):
         x += a + extra
     layer = layer.crop(layer.getbbox())  # 紧致裁剪到墨迹
     tw, th = layer.size
-    with_card = rng.random() < 0.6
+    with_card = (rng.random() < 0.6) if card is None else bool(card)
     pad = 3
     cp = int(float(rng.uniform(0.15, 0.5)) * th) if with_card else 0  # 卡片内边距
     W, H = tw + 2 * (pad + cp), th + 2 * (pad + cp)
@@ -495,24 +525,44 @@ def build_sample(rng, cfg, scene_fonts):
     """合成一张样本; target 全部丢失/不可读时返回 None(交由上层重 roll, 原因计入 REJECT)。"""
     S = cfg["scene_size"]
     query = gen_code(rng)
-    # 文本清单: 1~2 个 target(同一 query 多处出现) + 0~3 干扰(可选 hard negative)
+    # 文本清单: 1~2 个 target(同一 query 多处出现) + 0~3 干扰, 其中 1~2 个 hard negative
+    # (近邻对抗串, 与 target 同字体/同卡片/同墨色极性——fppeek 实锤误检 100% 是干扰串,
+    #  全是一位之差/同数字重分段的近邻且带高分; 随机字体随机卡的干扰对判别力没有贡献)
     max_texts = cfg["max_texts_per_scene"]
     n_target = min(int(rng.integers(cfg["target_count_range"][0], cfg["target_count_range"][1] + 1)),
                    max_texts)
-    hard = rng.random() < cfg["hard_neg_prob"]
     n_distr = int(rng.integers(cfg["distractor_count_range"][0], cfg["distractor_count_range"][1] + 1))
     n_distr = min(n_distr, max(0, max_texts - n_target))
-    if hard and n_distr == 0 and n_target < max_texts:
+    hcr = cfg.get("hard_neg_count_range")
+    n_hard = (int(rng.integers(hcr[0], hcr[1] + 1)) if hcr is not None
+              else int(rng.random() < cfg["hard_neg_prob"]))  # 旧配置回退: 0/1 伯努利
+    if n_hard > 0 and n_distr == 0 and n_target < max_texts:
         n_distr = 1  # hard negative 至少占一个干扰位
-    texts = [[query, 1] for _ in range(n_target)]
+    n_hard = min(n_hard, n_distr)
+    texts = [[query, 1, 0] for _ in range(n_target)]
     for i in range(n_distr):
-        s = hard_negative(rng, query) if (hard and i == 0) else gen_distractor(rng)
+        is_hard = int(i < n_hard)
+        s = hard_negative(rng, query) if is_hard else gen_distractor(rng)
         for _ in range(4):  # 干扰串不得与 query 相同
             if s != query:
                 break
-            s = gen_distractor(rng)
+            s = hard_negative(rng, query) if is_hard else gen_distractor(rng)
         if s != query:
-            texts.append([s, 0])
+            texts.append([s, 0, is_hard])
+    # 字体/卡片预分配: target 随机; hard-neg 拷贝随机一个 target 的字体与卡片决策(同字体同卡);
+    # 普通干扰维持随机。卡片决策从 render_text_patch 上提至此, 正是为了可拷贝。
+    tfonts = [None] * len(texts)
+    tcards = [None] * len(texts)
+    tgt_idx = [i for i, t in enumerate(texts) if t[1] == 1]
+    for i in tgt_idx:
+        tfonts[i] = scene_fonts[int(rng.integers(len(scene_fonts)))]
+        tcards[i] = rng.random() < 0.6
+    for i, t in enumerate(texts):
+        if t[2]:
+            d = tgt_idx[int(rng.integers(len(tgt_idx)))]
+            tfonts[i], tcards[i] = tfonts[d], tcards[d]
+        elif tfonts[i] is None:
+            tfonts[i] = scene_fonts[int(rng.integers(len(scene_fonts)))]
     # 1) 背景  2) 弹性形变(仅背景)
     scene = elastic(rng, gen_background(rng, S))
     # 3) 文本贴片(target 严禁被遮挡/截断/不可读: 任何新文本覆盖已有 target 面积 >15%
@@ -525,12 +575,11 @@ def build_sample(rng, cfg, scene_fonts):
     boxes = []   # 已贴文本的轴对齐包围盒
     talphas = []  # 每个 target 的字形 alpha 掩码(供光度后的可读性终检)
     tinfo = []   # 每个 target 的构造信息 (low_contrast, bg_mean, bg_std), 调测用
-    for text, is_t in texts:
-        fp = scene_fonts[int(rng.integers(len(scene_fonts)))]
-        low_contrast = rng.random() < 0.15
+    for (text, is_t, is_hard), fp, card_f in zip(texts, tfonts, tcards):
+        low_contrast = (rng.random() < 0.15) and not is_hard  # hard-neg 必须可读, 不走低对比
         th_cap = 44
         for _ in range(8):  # target 必须能完整入框: 放不下就压低字高重渲
-            patch, rect, ga = render_text_patch(rng, text, fp, th_cap=th_cap)
+            patch, rect, ga = render_text_patch(rng, text, fp, th_cap=th_cap, card=card_f)
             warped, tc, gaw = warp_patch(rng, patch, rect, extra=ga if is_t else None)
             ph, pw = warped.shape[:2]
             if not is_t or (pw <= FIT and ph <= FIT):
@@ -557,11 +606,11 @@ def build_sample(rng, cfg, scene_fonts):
                 break
         if not ok:
             continue  # 位置重试失败, 放弃该文本
-        # target 墨色按贴入处背景校正: 亮底深字/暗底亮字(正常), 或背景 ±[35,95](低对比);
-        # 干扰串仅低对比路径(不做极性校正, 不可读的干扰无害)
+        # target/hard-neg 墨色按贴入处背景校正: 亮底深字/暗底亮字(正常), 或背景 ±[35,95](低对比);
+        # 仅普通干扰串不校正(不可读的干扰无害); hard-neg 必须可读, 与 target 同路径
         bgm = bgs = None
         fb = False  # 极性校正重渲 4 轮不入框退回原始渲染的标记(调测用)
-        if is_t or low_contrast:
+        if is_t or is_hard or low_contrast:
             x1, y1 = max(0, int(bb[0])), max(0, int(bb[1]))
             x2, y2 = min(S, int(bb[2]) + 1), min(S, int(bb[3]) + 1)
             if x2 > x1 and y2 > y1:
@@ -576,7 +625,8 @@ def build_sample(rng, cfg, scene_fonts):
                 if is_t:  # 校正重渲后尺寸会变: 压低字高重试至入框(最多 4 轮), 绝不退回随机极性
                     fb = True
                     for _ in range(4):
-                        patch2, rect2, ga2 = render_text_patch(rng, text, fp, th_cap=th_cap, **kw)
+                        patch2, rect2, ga2 = render_text_patch(rng, text, fp, th_cap=th_cap,
+                                                               card=card_f, **kw)
                         warped2, tc2, gaw2 = warp_patch(rng, patch2, rect2, extra=ga2)
                         tcmn2, tcmx2 = tc2.min(0), tc2.max(0)
                         lo_x, hi_x = PLACE_M - tcmn2[0], S - PLACE_M - tcmx2[0]
@@ -591,7 +641,8 @@ def build_sample(rng, cfg, scene_fonts):
                         th_cap = max(10, int(th_cap * 0.85))
                     # 4 轮仍不入框(极罕见) -> 保持原样, 由终检门兜底
                 else:
-                    patch2, rect2, _ = render_text_patch(rng, text, fp, th_cap=th_cap, **kw)
+                    patch2, rect2, _ = render_text_patch(rng, text, fp, th_cap=th_cap,
+                                                         card=card_f, **kw)
                     warped2, tc2, _ = warp_patch(rng, patch2, rect2)
                     patch, warped, tc = patch2, warped2, tc2
                 bb = _aabb(tc + [px, py])
@@ -654,8 +705,9 @@ def build_sample(rng, cfg, scene_fonts):
             break
     if bad is not None:
         return _rej(bad)
-    # mask: 整串 query 标准渲染
-    mask = render_mask(query, cfg["mask_font"], cfg["mask_height"], cfg["mask_width"])
+    # mask: 整串 query 标准渲染(font_pool 非空时字体/字重抖动, 部署侧字体域漂兜底)
+    mask = render_mask(query, cfg["mask_font"], cfg["mask_height"], cfg["mask_width"],
+                       rng=rng, font_pool=cfg.get("mask_fonts"))
     return query, mask, scene, out_boxes, out_flags
 
 
@@ -704,6 +756,10 @@ def main():
     cfg = {k: dcfg[k] for k in ("scene_size", "mask_height", "mask_width", "mask_font",
                                 "max_texts_per_scene", "hard_neg_prob",
                                 "target_count_range", "distractor_count_range")}
+    if "hard_neg_count_range" in dcfg:  # 可选: 每场景 hard-neg 个数(覆盖 hard_neg_prob 伯努利)
+        cfg["hard_neg_count_range"] = list(dcfg["hard_neg_count_range"])
+    if "mask_fonts" in dcfg:  # 可选: mask 字体池(字体/字重抖动增广)
+        cfg["mask_fonts"] = list(dcfg["mask_fonts"])
     splits = []
     if args.split in ("both", "train"):  # 训练池(不含 val held-out 字体)
         splits.append(("train", 0, dcfg["train_size"], list(dcfg["scene_fonts"])))

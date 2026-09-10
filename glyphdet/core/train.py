@@ -17,9 +17,9 @@ import torch.nn.functional as F
 import yaml
 from torch.utils.data import DataLoader
 
-from dataset import GlyphDataset
-from decode import dfl_expect
-from model import GlyphDet, count_params
+from glyphdet.core.dataset import GlyphDataset
+from glyphdet.core.decode import dfl_expect
+from glyphdet.core.model import GlyphDet, count_params
 
 
 def focal_sum(logit, target, weight, alpha=0.25, gamma=2.0):
