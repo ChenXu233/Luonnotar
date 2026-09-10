@@ -1,7 +1,8 @@
 {
   // 告诉 Pylance：工作区根（Luonnotar/）是合法的 import 根，顶级包 `glyphdet` 在这里。
   // 解决 `from glyphdet.core.dataset import ...` 这类包导入无法解析的问题。
-  // （运行时 PDM 会把 `glyphdet` 作为可编辑包装入 .venv/site-packages，无需 PYTHONPATH 注入。）
+  // （运行时由 glyphdet/dev_setup.py 写 .pth 到 .venv/site-packages/，让 import glyphdet
+  //  在 cwd=glyphdet/ 下也能解析到 glyphdet/__init__.py。IDE/运行时使用同一套路径。）
   "python.analysis.extraPaths": [
     "."
   ],

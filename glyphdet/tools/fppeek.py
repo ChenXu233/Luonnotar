@@ -19,7 +19,7 @@ import yaml
 from glyphdet.core.dataset import GlyphDataset
 from glyphdet.core.decode import decode_outputs
 from glyphdet.core.eval import iou_matrix
-from glyphdet.core.model import GlyphDet
+from glyphdet.core.model import GlyphDet, build_model
 
 CROP = 208  # 特写面板边长
 
@@ -28,8 +28,12 @@ def make_tile(val, idx, fp_box, fp_score, tag, pb, ps):
     row = val.rows[idx]
     scene_bgr = cv2.imdecode(
         np.fromfile(str(val.root / row["scene"]), dtype=np.uint8), cv2.IMREAD_COLOR)
+    if scene_bgr is None:
+        raise FileNotFoundError(f"场景读取失败: {val.root / row['scene']}")
     mask_g = cv2.imdecode(
         np.fromfile(str(val.root / row["mask"]), dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
+    if mask_g is None:
+        raise FileNotFoundError(f"mask 读取失败: {val.root / row['mask']}")
     # mask 面板：白底黑字缩到 208 宽，padding 到 CROP 高
     mask3 = cv2.cvtColor(mask_g, cv2.COLOR_GRAY2BGR)
     mh, mw = mask3.shape[:2]
@@ -78,20 +82,23 @@ def main():
     m, ec = cfg["model"], cfg["eval"]
     device = "cuda" if torch.cuda.is_available() else "cpu"
     ckpt = torch.load(args.weights, map_location="cpu", weights_only=False)
-    model = GlyphDet(cfg)
+    model = build_model(cfg)
     model.load_state_dict(ckpt["model"])
     model.eval().to(device)
 
     val = GlyphDataset(Path(cfg["data"]["out_dir"]) / "val")
-    fps = []  # (score, idx, box, tag)
+    fps: list[tuple[float, int, "np.ndarray", str]] = []  # (score, idx, box, tag)
+    # 缓存 idx -> 该样本的 (pb, ps)，避免画图时重复 forward/NMS（非确定性会让 fp_box 错位）
+    pred_cache: dict[int, tuple["np.ndarray", "np.ndarray"]] = {}
     n_pred = 0
     n_scan = min(len(val), args.scan)
     for idx in range(n_scan):
-        scene, mask, boxes, is_target = val[idx]
+        scene, mask, boxes, is_target = val[idx]  # type: ignore[misc]
         with torch.no_grad():
             outs = model(scene[None].to(device), mask[None].to(device))
         pb, ps = decode_outputs(outs, m["strides"], m["reg_max"],
                                 score_thr=0.3, nms_iou=ec["nms_iou"])
+        pred_cache[idx] = (pb, ps)
         if not len(pb):
             continue
         boxes_np, tgt = boxes.numpy(), is_target.numpy()
@@ -115,11 +122,7 @@ def main():
         sc = np.array([f[0] for f in fps])
         print(f"fp 分数: mean {sc.mean():.3f} p50 {np.median(sc):.3f} max {sc.max():.3f}")
 
-    tiles = [make_tile(val, idx, b, s, tag,
-                       *decode_outputs(
-                           model(val[idx][0][None].to(device),
-                                 val[idx][1][None].to(device)),
-                           m["strides"], m["reg_max"], score_thr=0.3, nms_iou=ec["nms_iou"]))
+    tiles = [make_tile(val, idx, b, s, tag, *pred_cache[idx])
              for s, idx, b, tag in fps[: args.n]]
     rows = []
     for i in range(0, len(tiles), 2):

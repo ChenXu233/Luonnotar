@@ -14,7 +14,7 @@ import yaml
 from glyphdet.core.dataset import GlyphDataset
 from glyphdet.core.decode import decode_outputs
 from glyphdet.core.eval import iou_matrix
-from glyphdet.core.model import GlyphDet
+from glyphdet.core.model import GlyphDet, build_model
 
 
 def main():
@@ -28,14 +28,14 @@ def main():
     m, ec = cfg["model"], cfg["eval"]
     device = "cuda" if torch.cuda.is_available() else "cpu"
     ckpt = torch.load(args.weights, map_location="cpu", weights_only=False)
-    model = GlyphDet(cfg)
+    model = build_model(cfg)
     model.load_state_dict(ckpt["model"])
     model.eval().to(device)
 
     val = GlyphDataset(Path(cfg["data"]["out_dir"]) / "val")
     fails = []
     for idx in range(len(val)):
-        scene, mask, boxes, is_target = val[idx]
+        scene, mask, boxes, is_target = val[idx]  # type: ignore[misc]
         with torch.no_grad():
             outs = model(scene[None].to(device), mask[None].to(device))
         pb, ps = decode_outputs(outs, m["strides"], m["reg_max"],
@@ -56,8 +56,14 @@ def main():
         row = val.rows[idx]
         scene_bgr = cv2.imdecode(
             np.fromfile(str(val.root / row["scene"]), dtype=np.uint8), cv2.IMREAD_COLOR)
+        if scene_bgr is None:
+            print(f"[warn] skip idx={idx}: 场景读取失败 {val.root / row['scene']}")
+            continue
         mask_g = cv2.imdecode(
             np.fromfile(str(val.root / row["mask"]), dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
+        if mask_g is None:
+            print(f"[warn] skip idx={idx}: mask 读取失败 {val.root / row['mask']}")
+            continue
         # mask 画布放大到场景同宽，白底黑字，写 query
         mask3 = cv2.cvtColor(mask_g, cv2.COLOR_GRAY2BGR)
         mh, mw = mask3.shape[:2]
