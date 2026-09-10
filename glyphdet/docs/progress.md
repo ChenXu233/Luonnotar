@@ -17,6 +17,37 @@
 
 - margin 排序损失版（旧毒数据）epoch 18/45 中期 eval：AUROC 0.876 已超 f39 全程 0.84 —— 排序损失假设成立。但旧数据三大毒 bug 已修，继续在毒数据上训 27 epoch 价值低，**杀掉让 GPU**，margin 损失已内置于 maskfix config（weight 0.5 / margin 2.0 / hard_neg_center 3.0）。
 - **mvp_maskfix 训练启动**（runs/mvp_maskfix）：datasets/mvp2 v5 干净数据（mask 384 等比缩放 + target 完整入框 + 墨色极性校正 + 纯字形 alpha 可读性终检），45ep，含全部修正。数据抽检：train 50000 / val 1000 齐全，6 张跨段目检全过。
+- **epoch 13/45 中期 eval（val=mvp2/val 干净配方，与旧毒 val 数字不完全同分布）**：**AUROC 0.9241 已破 0.9 门槛**（旧基线全程最好 0.85，margin 中期 0.876）；fp_rate 0.043（旧 0.14~0.21 量级）暴降，neg_score_mean 0.072 vs tgt 0.400 间距拉开；top1 0.485 / recall 0.36 仍低待退火。loss 侧证：match 0.061 vs 旧同配置 0.186，margin 项 0.083 vs 旧 0.581（旧毒数据上 hinge 压不下去——隐身/残串 target 与 hard-neg 不可分）。
+
+## 2026-09-10 100k+mask 抖动全程裁决（epoch 40/40，held-out comic/msjh val 1000）
+
+- **终 eval：AUROC 0.9508 ✓；top1 0.923；recall@0.5 0.9001（门槛 95% 未达）；fp 0.0833（门槛 1% 未达）；GPU 13.52ms / CPU-PC 74.16ms**。对比 maskfix 终局（0.9361/0.907/0.894/0.104）：AUROC +0.015、top1 +0.016、recall +0.006、fp −0.021——**数据量翻倍+mask 抖动收益递减**，泛化平台期特征明显。注意 ep12 中期 0.955 略高于终局 0.9508，后段退火未再涨（轻微过拟合训练字体）。
+- recall_iou0.3 == recall@0.5（0.9001）→ 框质量依旧无罪，漏检=判别置信度不足；fp 8.3% 是离门槛最远的指标。
+- thr_sweep：阈值 0.3 时 recall 0.9296/fp 0.0911 —— 降阈值能换 recall 但 fp 更差，印证"低阈值+时序积分"路线必须以压 fp 为前提。
+- **下一步**：fppeek（tools/fppeek.py，新建）分解 fp 成分（distr 干扰串型 vs bg 背景型）+ failpeek 重跑，给用户人工判定后定配方：对抗负样本（同字体/同卡 hard-neg）vs 类文字背景纹理。
+
+## 2026-09-10 fppeek/failpeek 裁决（终局权重，val 前 300 张）
+
+- **fp 成分：39/39 全是 distr 型（框住干扰串），0 个背景型** → 类文字背景纹理路线砍掉，对抗负样本是唯一方向（用户预判正确）。
+- **fp 分数高得危险：mean 0.675 / p50 0.696 / max 0.914**——不是低分噪声，是高分误检，降阈值+时序积分路线的前提（时序层杀随机 fp）对这类"空间稳定型 fp"无效，必须在数据/模型层压掉。
+- fp 两类实锤模式（top16 特写人工核查）：① **一位之差**：Q=7870 fp 框 7874（0.91）、Q=81449 fp 框 8049（0.91）；② **同数字重分段**：Q=9-77-62674 fp 框 97-7-62674（0.84）、Q=47-95-8384 fp 框 479-5-8384（0.88）——xcorr 模板匹配对字符集合敏感、对逐位身份/分段位置不够敏感。
+- failpeek 重跑（failpeek_100k.png）：漏检主导模式=**同场景双 target 实例，一个贴线检出（0.49~0.56）一个漏**——target 分数带与 hard-neg 分数带在 0.5~0.9 区间重叠，fp↓ 与 recall↑ 是同一个杠杆：拉宽两分布间距。
+- **v6 配方裁决**：每场景显式注入 1~2 个 hard-neg（一位之差 / 同数字重分段 / 截断少位），hard-neg 与 target 同字体同卡片同墨色极性；背景配方不动；维持 100k+40ep。出图：docs/fpreview/fppeek.png、docs/failreview/failpeek_100k.png。
+- **v6 落地**（experiments/mvp4_hardneg）：`hard_negative` 拆 `_one_mutation`，sub 数字 60% 走形近对（_CONFUSE：0/8/6、1/7、3/8/5、5/6、6/9/0、8/9 等），hyphen 移位 1→1~2 格，30% 叠第二次扰动（覆盖"换一位+少一位"）；del 避开两连字符夹位（防 "--"，冒烟实锤过）。`render_text_patch` 加 `card` 参数（卡片决策上提到 build_sample 才可拷贝）；build_sample 预分配字体/卡片：hard-neg 拷贝随机 target 的字体与卡片决策、强制走极性校正（必须可读、禁止低对比）；`hard_neg_count_range: [1,2]` 覆盖旧 hard_neg_prob 伯努利（旧键保留兼容）。冒烟 8 张目检全过：近邻串同字体同卡清晰可见（7874 型、重分段型、二次扰动型齐全）。val 复用 mvp2 保口径（新配方的 val 会更难，不可与谱系对比，故只产 train）。
+- **ep29 中期裁决（并发训练测得，infer_ms 失真勿采信）**：AUROC 0.9384 / top1 0.863 / recall 0.8095 / fp 0.0897——headline 全面低于 maskaug 终局，但 recall 历来退火段才爬（maskaug ep12 仅 0.64→终 0.90）。**关键证据是 fppeek：fp 38 个仍全是 distr 型，分数 mean 0.679/p50 0.706/max 0.921 与 maskaug 终局完全持平，失败模式一字不差（一位之差、重分段原图重现）**。train 侧 margin 早已归零 = 训练字体上的近邻判别已解决却不泛化到 held-out 字体。**疑似根因：模板 T 宽度仅 8 token，10~12 字符的串每字符分不到 1 个 token，逐位判别在表示层被平均掉，模型只能靠背训练字体的细节作弊**。若 ep40 终局确认 fp 不动，下一杠杆=架构：模板加宽（8→16/24 token）/ P4 浅层也做 xcorr——不是扩容，是给逐位判别开物理通道。
+- 环境备忘：core/ 已重构为包（glyphdet.core.*，__init__.py 定位"稳定引擎层"），eval 等须 `PYTHONPATH=仓库根 python -m glyphdet.core.eval` 方式运行；tools 已同步转换。相对路径（datasets/...）仍以 CWD=glyphdet 解析。
+
+## 2026-09-10 100k+mask 抖动中期裁决（epoch 12/40）
+
+- **中期 eval：AUROC 0.955**（maskfix 同期 0.9241，+0.031）；top1 0.797（同期 0.485）；recall@0.5 0.6445（同期 0.36）；fp 0.055（同期 0.043 持平偏好）。任务更难（mask 字体/字重抖动）但 val 更高 → 泛化真在涨，非过拟合假象。infer_ms 受训评并发争抢影响失真，勿采信。
+- 同 epoch loss 对比：match 0.043 vs 0.075、margin 0.019 vs 0.032——更难任务更低损失。
+
+## 2026-09-09 maskfix 全程裁决（epoch 45，held-out comic/msjh val 1000）
+
+- **终 eval：AUROC 0.9361 ✓（门槛 0.9）；top1 0.907；recall@0.5 0.894（门槛 95% 未达）；fp 0.104（门槛 1% 未达）；GPU 13.5ms/CPU 83ms**。train loss≈0（match 0.001）→ 已过拟合，瓶颈=泛化而非容量。
+- failpeek + 按目标高度分桶：recall 在 14-20/20-30/30-45/45+px 全平（92/88/93/93%）→ **小字假设否证**，漏检均匀分布，主因是 held-out 字体泛化 + 低对比/模糊复合。
+- **下一轮（进行中）**：datasets/mvp3 = 100k 训练数据 + **mask 字体/字重抖动**（msyh/arial/segoe/calibri/tahoma/verdana 随机 + 30% 描边加粗；迫使模板匹配对 mask 字体不变，同时兜住部署侧 App 渲染 mask 的字体域漂）。val 直接复用 mvp2/val 保口径。config：experiments/mvp3_100k/config.yaml（run=mvp_100k_maskaug，40ep，其余同 maskfix）。
+- 部署侧备忘：mask 字体在 App 端用 fonttools subset 打包雅黑（仅 0-9/字母/分隔符，几 KB）可完全消除域漂；二期实现时二选一。
 
 ## 2026-09-09 failpeek 实锤两个数据 bug（用户指示手动核查失败样本 mask）
 
@@ -37,9 +68,8 @@
 
 ## 进行中
 
-- **mvp_f39_e45_margin**（runs/，bash 后台）：f39 配方 + margin 排序损失（hard-neg 中心区最高分 vs 正样本均分的 hinge，margin 2.0 logit，weight 0.5），直攻排序而非逐点分类。数据 = datasets/mvp（每 epoch 重读盘，训完前不得重产该目录）。
-- **mvp2 数据全量合成 v3**（datasets/mvp2，bash 后台）：mask 压扁修复 + target 截断修复 + 墨色极性校正 + 可读性终检门，50k train + 1k val，~1h（终检重 roll 开销）。合成完训练 `experiments/mvp2_maskfix/config.yaml`（run_name=mvp_maskfix，45ep ~3.7h）。
-- 裁决顺序：margin 训完先 eval `runs/mvp_f39_e45/last.pt` → 再训 maskfix → eval + failpeek 复看。
+- **无后台任务**。mvp_100k_maskaug（40ep）已训完并终 eval（见上）。（历史：margin 实验在 ep18 中期裁决后杀掉让 GPU；mvp2 v5 数据、maskfix 45ep 均已完结。）
+- 待用户人工判定：docs/failreview/（maskfix 时代 16 张漏检，未回收判定）；新一轮 fppeek/failpeek 出图后一并判定。
 
 ## 已确认的修正（按用户裁定）
 
