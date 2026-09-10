@@ -15,7 +15,7 @@ import onnxruntime as ort
 import torch
 import yaml
 
-from model import GlyphDet
+from glyphdet.core.model import GlyphDet
 
 
 def main():

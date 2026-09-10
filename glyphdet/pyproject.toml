@@ -21,14 +21,35 @@ requires-python = "==3.13.*"
 readme = "README.md"
 license = {text = "MIT"}
 
+# 本项目仅本地开发用，不会发到 PyPI。
+# PDM 默认不会把本项目装为可编辑包（见 setup 脚本手动生成 .pth）。
+[tool.pdm]
+distribution = false
+
 [[tool.pdm.source]]
 name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"
 include_packages = ["torch", "torchvision"]
 exclude_packages = ["*"]
 
-[tool.pdm]
-distribution = false
-
 [tool.pdm.resolution]
 respect-source-order = true
+
+# 便捷别名（与 README 复现命令对齐）：
+#   pdm run setup   →  一次性生成 glyphdet_dev.pth（首次 clone / 重建 venv 后跑一次）
+#   pdm run train   →  python -m glyphdet.core.train
+#   pdm run eval    →  python -m glyphdet.core.eval
+#   pdm run synth   →  python -m glyphdet.core.synth
+#   pdm run export  →  python -m glyphdet.core.export_onnx
+#   pdm run fppeek  →  python -m glyphdet.tools.fppeek
+#   pdm run failpeek → python -m glyphdet.tools.failpeek
+#   pdm run peek    →  python -m glyphdet.tools.peek
+[tool.pdm.scripts]
+setup = "python dev_setup.py"
+train = "python -m glyphdet.core.train"
+eval = "python -m glyphdet.core.eval"
+synth = "python -m glyphdet.core.synth"
+export = "python -m glyphdet.core.export_onnx"
+fppeek = "python -m glyphdet.tools.fppeek"
+failpeek = "python -m glyphdet.tools.failpeek"
+peek = "python -m glyphdet.tools.peek"
