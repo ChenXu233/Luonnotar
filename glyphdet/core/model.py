@@ -342,13 +342,19 @@ class NeckV2(nn.Module):
 
 
 class HeadV2(nn.Module):
-    """v2 头：P2/P3 两级做模板互相关（P2 盖小字、P3 盖大字），P4 仅余弦粗分。
+    """v2 头：三级全配模板互相关（P2 盖小字、P3 盖中字、P4 盖大字/长串）。
 
-    模板核不再整串压扁：P2 (4,24)/(6,36) → 字高 16/24px；P3 (4,24)/(6,36)/(8,48)
-    → 字高 32/48/64px。10 字符长串在 (6,36) 下每字符 3.6 列（v1 (2,12) 仅 1.2 列）。
-    输出通道布局同 v1：[score_logit(1), reg_dfl(4*reg_max), centerness(1)]。"""
+    模板核不再整串压扁：P2 (4,24)/(6,36)；P3 (4,24)/(6,36)/(8,48)；P4 (4,24)/(6,36)。
+    10 字符长串在 (6,36) 下每字符 3.6 列（v1 (2,12) 仅 1.2 列）。
+    输出通道布局（v2.2 起移除 centerness）：[score_logit(1), reg_dfl(4*reg_max)]。"""
 
-    XCORR_SCALES = {0: ((4, 24), (6, 36)), 1: ((4, 24), (6, 36), (8, 48))}
+    # 三级全配 xcorr——levelstat 实锤 v1 的 86% 检出发生在仅余弦级别（近邻混淆病根），
+    # v2 曾留 s16 仅余弦的同构缺陷（大字/长串占 target 32%），v2.1 补齐
+    XCORR_SCALES = {
+        0: ((4, 24), (6, 36)),
+        1: ((4, 24), (6, 36), (8, 48)),
+        2: ((4, 24), (6, 36)),
+    }
 
     def __init__(self, c=96, wdim=128, reg_max=8, tpl_ch=48):
         super().__init__()
@@ -359,12 +365,16 @@ class HeadV2(nn.Module):
         self.fuse = nn.ModuleDict(  # 每级：cos + k 个相关图 → logit
             {str(i): nn.Conv2d(1 + len(k), 1, 1) for i, k in self.XCORR_SCALES.items()}
         )
-        self.fuse_p4 = nn.Conv2d(1, 1, 1)
+        if 2 not in self.XCORR_SCALES:
+            self.fuse_p4 = nn.Conv2d(
+                1, 1, 1
+            )  # 末级仅余弦时的占位融合（v2.1 起末级也有 xcorr）
         self.alpha = nn.Parameter(torch.tensor(10.0))
         self.beta = nn.Parameter(torch.tensor(-3.0))
         self.reg_convs = nn.ModuleList(ConvBNAct(c, c) for _ in range(3))
         self.reg_out = nn.ModuleList(
-            nn.Conv2d(c, 4 * reg_max + 1, 1) for _ in range(3)
+            nn.Conv2d(c, 4 * reg_max, 1)
+            for _ in range(3)  # v2.2 起无 centerness
         )
 
     def forward(self, feats, w, tpl):

@@ -18,7 +18,8 @@ import yaml
 from torch.utils.data import DataLoader
 
 from glyphdet.core.dataset import GlyphDataset
-from glyphdet.core.decode import dfl_expect
+from glyphdet.core.decode import dfl_expect, has_cen
+from glyphdet.core.eval import quick_eval
 from glyphdet.core.model import GlyphDet, build_model, count_params
 
 
@@ -119,9 +120,10 @@ def compute_loss(model, scene, mask, targets, cfg):
                  px + reg_t[:, 2] * s, py + reg_t[:, 3] * s], 1,
             )
             reg_sum = reg_sum + ciou_loss(pred_box, gt_box) * n_pos
-            cen_sum = cen_sum + F.binary_cross_entropy_with_logits(
-                out[:, -1][pos], cen_t[pos], reduction="sum"
-            )
+            if has_cen(out.shape[1], reg_max):  # v2.2 起无 cen 通道，跳过
+                cen_sum = cen_sum + F.binary_cross_entropy_with_logits(
+                    out[:, -1][pos], cen_t[pos], reduction="sum"
+                )
     n_pos = max(n_pos_total, 1)
     total = (
         lw["match_weight"] * match_sum / n_pos
@@ -195,6 +197,12 @@ def main():
     (run_dir / "code_version.txt").write_text(git_version() + "\n", encoding="utf-8")
     log_f = open(run_dir / "log.txt", "a", encoding="utf-8")
 
+    # 周期性轻量 eval（Lightning check_val_every_n_epoch / ultralytics fitness 同款惯例）：
+    # 每 eval_every epoch 在 val 等距子集上出 auroc/recall/top1/fp，auroc 最优存 best.pt
+    eval_every = tc.get("eval_every", 0)
+    val_ds = GlyphDataset(root / "val") if eval_every else None
+    best_auroc = -1.0
+
     total_epochs = tc["epochs"]
     steps_per_epoch = len(loader)
     warmup_steps = tc["warmup_epochs"] * steps_per_epoch
@@ -240,6 +248,19 @@ def main():
         log_f.flush()
         torch.cuda.reset_peak_memory_stats()
         torch.save({"model": model.state_dict(), "cfg": cfg}, run_dir / "last.pt")
+        if val_ds is not None and ((epoch + 1) % eval_every == 0 or epoch + 1 == total_epochs):
+            r = quick_eval(model, val_ds, cfg, device, tc.get("eval_n", 300))
+            msg = (
+                f"  [eval@{epoch+1}] auroc {r['auroc']:.4f} recall {r['recall']:.4f} "
+                f"top1 {r['top1']:.4f} fp {r['fp']:.4f}"
+            )
+            print(msg)
+            log_f.write(msg + "\n")
+            log_f.flush()
+            if r["auroc"] > best_auroc:
+                best_auroc = r["auroc"]
+                torch.save({"model": model.state_dict(), "cfg": cfg,
+                            "epoch": epoch + 1, "auroc": best_auroc}, run_dir / "best.pt")
     log_f.close()
     print(f"完成。权重: {run_dir}/last.pt")
 

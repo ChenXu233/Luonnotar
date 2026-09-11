@@ -1,13 +1,18 @@
 """裸 head 输出 → 框的参考 decode 实现（训练评估与未来 Dart/C++ 移植共用同一语义）。
 
-输出张量布局（每尺度）：(B, 2+4*reg_max, H, W) = [score_logit, reg_dfl(4*reg_max), centerness]。
-最终分 = sigmoid(score_logit) * sigmoid(centerness)。
+输出张量布局（每尺度）：(B, C, H, W)，C = 1+4*reg_max 或 2+4*reg_max（后者含 centerness，
+v1 遗存；v2.2 起移除——cen 标签被压在 [0.44,0.80] 窄带，模型只学到 0.06 nat，等于常数因子）。
+最终分 = sigmoid(score_logit)（有 cen 通道时再乘 sigmoid(centerness)，按通道数自动判别）。
 DFL：reg 沿 reg_max softmax 后取期望 → l,t,r,b（单位：stride 格数）。
 """
 
 import numpy as np
 import torch
 import torchvision
+
+
+def has_cen(C, reg_max):
+    return C == 2 + 4 * reg_max
 
 
 def dfl_expect(reg, reg_max):
@@ -26,7 +31,9 @@ def decode_outputs(
     all_boxes, all_scores = [], []
     for out, s in zip(outs, strides):
         B, C, H, W = out.shape
-        score = torch.sigmoid(out[:, 0]) * torch.sigmoid(out[:, -1])  # (B,H,W)
+        score = torch.sigmoid(out[:, 0])
+        if has_cen(C, reg_max):
+            score = score * torch.sigmoid(out[:, -1])  # (B,H,W)
         reg = out[:, 1 : 1 + 4 * reg_max].permute(0, 2, 3, 1).reshape(-1, 4 * reg_max)
         ltrb = dfl_expect(reg, reg_max) * s  # (H*W, 4)，像素单位
         ys, xs = torch.meshgrid(

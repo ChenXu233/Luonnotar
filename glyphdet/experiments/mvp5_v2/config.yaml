@@ -77,13 +77,15 @@ model:
   widths: [24, 48, 96, 160]
   neck_ch: 96
   mask_dim: 128
-  reg_max: 8
+  reg_max: 24
   strides: [4, 8, 16]
   assign: height
 
 train:
-  run_name: mvp_v2
+  run_name: mvp_v2_2
   epochs: 40
+  eval_every: 10
+  eval_n: 300
   batch_size: 16
   workers: 6
   lr: 0.001

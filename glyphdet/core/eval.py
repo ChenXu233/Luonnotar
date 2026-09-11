@@ -21,7 +21,7 @@ import torch
 import yaml
 
 from glyphdet.core.dataset import GlyphDataset, imread_chw
-from glyphdet.core.decode import decode_outputs
+from glyphdet.core.decode import decode_outputs, has_cen
 from glyphdet.core.model import GlyphDet, build_model
 
 
@@ -57,6 +57,61 @@ def box_max_score(score_map, box):
     if x2 <= x1 or y2 <= y1:
         return 0.0
     return float(score_map[y1:y2, x1:x2].max())
+
+
+@torch.no_grad()
+def quick_eval(model, val_ds, cfg, device, n=300):
+    """训练中期轻量评估：val 等距子集上的 auroc/recall@0.5/top1/fp。
+    与 main() 同口径（同一 decode 与分数图语义），供 train 周期性调用快速判定。"""
+    m, ec = cfg["model"], cfg["eval"]
+    idxs = np.linspace(0, len(val_ds) - 1, min(n, len(val_ds))).astype(int)
+    was_training = model.training
+    model.eval()
+    n_hit = n_target = n_pred = n_wrong = n_top1 = n_img_t = 0
+    tgt_scores, neg_scores = [], []
+    for idx in idxs:
+        scene, mask, boxes, is_target = val_ds[int(idx)]
+        outs = model(scene[None].to(device), mask[None].to(device))
+        pb, ps = decode_outputs(
+            outs, m["strides"], m["reg_max"],
+            score_thr=ec["score_threshold"], nms_iou=ec["nms_iou"],
+        )
+        boxes_np, tgt = boxes.numpy(), is_target.numpy()
+        gt_t = boxes_np[(tgt > 0.5) & (boxes_np.sum(1) > 0)]
+        gt_n = boxes_np[(tgt <= 0.5) & (boxes_np.sum(1) > 0)]
+        n_target += len(gt_t)
+        n_img_t += int(len(gt_t) > 0)
+        if len(pb):
+            iou_t = iou_matrix(pb, gt_t)
+            for j in range(len(gt_t)):
+                if (iou_t[:, j] >= ec["iou_threshold"]).any():
+                    n_hit += 1
+            wrong = (iou_t.max(1) < 0.3) if len(gt_t) else np.ones(len(pb), bool)
+            n_pred += len(pb)
+            n_wrong += int(wrong.sum())
+            top = int(np.argmax(ps))
+            if len(gt_t) and iou_t[top].max() >= ec["iou_threshold"]:
+                n_top1 += 1
+        maps = []
+        for out in outs:
+            full = torch.sigmoid(out[0, 0])
+            if has_cen(out.shape[1], m["reg_max"]):
+                full = full * torch.sigmoid(out[0, -1])
+            maps.append(torch.nn.functional.interpolate(
+                full[None, None], size=scene.shape[-2:], mode="bilinear")[0, 0])
+        s_map = torch.stack(maps).max(0).values.cpu().numpy()
+        for b in gt_t:
+            tgt_scores.append(box_max_score(s_map, b))
+        for b in gt_n:
+            neg_scores.append(box_max_score(s_map, b))
+    if was_training:
+        model.train()
+    return {
+        "auroc": auroc(tgt_scores, neg_scores),
+        "recall": n_hit / max(n_target, 1),
+        "top1": n_top1 / max(n_img_t, 1),
+        "fp": n_wrong / max(n_pred, 1) if n_pred else 0.0,
+    }
 
 
 def main():
@@ -131,7 +186,9 @@ def main():
         # 一位之差可分性：框内最高分（三级 sigmoid 分数图插值回原图后取逐点 max）
         maps = []
         for out in outs:
-            full = torch.sigmoid(out[0, 0]) * torch.sigmoid(out[0, -1])
+            full = torch.sigmoid(out[0, 0])
+            if has_cen(out.shape[1], m["reg_max"]):
+                full = full * torch.sigmoid(out[0, -1])
             maps.append(
                 torch.nn.functional.interpolate(
                     full[None, None], size=scene.shape[-2:], mode="bilinear"

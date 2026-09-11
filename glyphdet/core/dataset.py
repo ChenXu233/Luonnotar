@@ -30,6 +30,20 @@ LEVEL_RANGES_H = {4: (0, 28), 8: (28, 56), 16: (56, 1e9)}
 CENTER_SHRINK = 0.25
 
 
+def level_for_box(h, w, reg_max):
+    """字高定基准级；回归超界则上浮到能装下的最粗级。
+    v2.1 护栏：ltrb 目标 clip 在 reg_max-1.01 格；中心采样带内格点最远距左边
+    0.75w（CENTER_SHRINK=0.25），故按 0.75w 判定。旧规则 68% 目标被钳，
+    recall@0.5 存在结构性天花板。"""
+    lvls = sorted(LEVEL_RANGES_H)
+    i = next(
+        k for k, s in enumerate(lvls) if LEVEL_RANGES_H[s][0] <= h < LEVEL_RANGES_H[s][1]
+    )
+    while i < len(lvls) - 1 and 0.75 * w > (reg_max - 2) * lvls[i]:
+        i += 1
+    return lvls[i]
+
+
 def imread_chw(path, gray=False):
     """cv2 读图（中文路径安全），返回 CHW float [0,1]。"""
     flag = cv2.IMREAD_GRAYSCALE if gray else cv2.IMREAD_COLOR
@@ -71,8 +85,10 @@ def build_targets(boxes, is_target, strides, in_size, reg_max, hard_neg_w,
             cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
             hbw, hbh = (x2 - x1) * CENTER_SHRINK, (y2 - y1) * CENTER_SHRINK
             in_center = (np.abs(gx - cx) < hbw) & (np.abs(gy - cy) < hbh)
-            if assign == "height":  # 按字高（标量）分配级别，广播到网格
-                in_range = np.full((hw, hw), lo <= (y2 - y1) < hi, bool)
+            if assign == "height":  # 字高定级 + 宽度护栏（标量），广播到网格
+                in_range = np.full(
+                    (hw, hw), s == level_for_box(y2 - y1, x2 - x1, reg_max), bool
+                )
             else:
                 in_range = (maxd >= lo) & (maxd < hi)
             if is_target[j] > 0.5:

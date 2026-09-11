@@ -108,3 +108,17 @@
 - torch 2.11 ONNX 导出要 opset 18 + onnxscript；导出文件是 .onnx + .onnx.data 外部分离格式。
 - pdm 2.26 的 use_uv 配置写法是 `.pdm.toml` 顶层 `use_uv = false`（[python] 节写法会报 NoConfigError）。
 - 训练 90 分钟后台超时杀过首轮——长任务 timeout 给足 21600s。
+
+## v2.2（2026-02-25）：监督信号审计与修复（未开训，等 GPU 休息）
+
+- 实锤：v2 字高分配 × reg_max=8 → 68% 目标 ltrb 被 clip（s4 91%/s8 77%/s16 41%），recall@0.5 存在结构天花板；v1 免疫（maxd 边界=reg_max×stride 自洽）。报告：docs/supervision-analysis.md
+- 修复：reg_max 8→24；分配加宽度护栏 level_for_box（中心带最远 0.75w 超 (reg_max-2)×s 则上浮）。验证：钳位 0%、上浮 9.2%、reg 实测 max 21.51<22.99、零静默丢目标
+- 附带：centerness 实锤零信息（最优常数 BCE 0.670 vs 训练 0.61~0.63）→ HeadV2 砍 cen 通道（97ch），decode/eval 通道数自动判别兼容旧 ckpt
+- 冒烟全绿（CPU）：97ch 输出、reparam diff 8e-7、双布局 decode、compute_loss cen=0
+- run_name: mvp_v2_2，bs16，reg_max24 + 三级 xcorr + 无 cen —— 待开训
+- 病根未修（留 v3）：match 逐格位置先验监督 → 模型只看单字图形不看整串全等（levelstat 86% 余弦检出 + fppeek 近邻串 0.86 同根）；方案 A per-char min 聚合头 / B ROI 判别头
+
+### cen 移除的 toy 验证（tools/cenprobe.py，v1 last.pt + mvp4/val 100 张，CPU）
+- with cen 0.9515 / without 0.9481 / oracle cen 0.9320 → 概念天花板为负，移除定案
+- cen 预测 Pearson r=0.333（弱信号但非零），仅值 +0.003 AUROC；top-1 格点 94/100 变但指标不动
+- 注：v1 官方 eval 数据集是 datasets/mvp4/val（不是 mvp/val），工具默认值曾踩错
