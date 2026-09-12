@@ -83,8 +83,8 @@ model:
 
 train:
   run_name: mvp_v2_2
-  epochs: 40
-  eval_every: 10
+  epochs: 30
+  eval_every: 5
   eval_n: 300
   batch_size: 16
   workers: 6

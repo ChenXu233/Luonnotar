@@ -1,16 +1,16 @@
 import 'dart:async';
+import 'dart:math' as math;
 
-import 'package:fast_paddle_ocr/ocr.dart';
-import 'package:fast_paddle_ocr/ocr_camera_view.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_svg/flutter_svg.dart';
+import 'package:glyph_det/glyph_det.dart';
+import 'package:glyph_det/glyph_det_camera_view.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 import '../history/history_store.dart';
-import '../matching/pickup_matcher.dart';
-import '../ocr/ocr_service.dart';
+import '../ocr/glyph_det_service.dart';
 import '../theme/frost_theme.dart';
 import 'history_sheet.dart';
 
@@ -23,21 +23,21 @@ class ScanPage extends StatefulWidget {
 }
 
 class _ScanPageState extends State<ScanPage> with TickerProviderStateMixin {
-  final _ocr = OcrService();
+  final _det = GlyphDetService();
   final _history = HistoryStore();
   final _codeController = TextEditingController();
 
   Timer? _pollTimer;
   bool _polling = false;
-  OcrFrame _frame = OcrFrame.empty;
-  MatchResult? _match;
+  GlyphDetFrame _frame = GlyphDetFrame.empty;
+  GlyphDetBox? _match;
 
   bool _permissionDenied = false;
   bool _loading = true;
   bool _cameraOpen = false;
   bool _flashOn = false;
 
-  /// 当前相机朝向：0=前置 1=后置，默认后置（前置镜像已在上层翻转）
+  /// 当前相机朝向：0=前置 1=后置，默认后置
   int _facing = 1;
   bool _switchingCamera = false;
 
@@ -48,6 +48,10 @@ class _ScanPageState extends State<ScanPage> with TickerProviderStateMixin {
     vsync: this,
     duration: const Duration(milliseconds: 1200),
   )..repeat(reverse: true);
+
+  /// 取件码格式校验（数字段 + 连字符，如 23-5-1234）。
+  static bool _isValidCode(String s) =>
+      RegExp(r'^\d+(-\d+)+$').hasMatch(s.trim());
 
   @override
   void initState() {
@@ -65,8 +69,8 @@ class _ScanPageState extends State<ScanPage> with TickerProviderStateMixin {
       return;
     }
     try {
-      await _ocr.loadModel();
-      await _ocr.openCamera(_facing);
+      await _det.loadModel();
+      await _det.openCamera(_facing);
       if (!mounted) return;
       setState(() {
         _loading = false;
@@ -74,24 +78,23 @@ class _ScanPageState extends State<ScanPage> with TickerProviderStateMixin {
       });
       _startPolling();
     } catch (e) {
-      debugPrint('OCR init failed: $e');
+      debugPrint('glyph_det init failed: $e');
       if (mounted) setState(() => _loading = false);
     }
   }
 
   void _startPolling() {
-    // 100ms 轮询：原生管线已去防抖全速跑，UI 刷新不能成为新瓶颈。
+    // 100ms 轮询：原生管线全速跑，UI 刷新不能成为新瓶颈。
     // _polling 防止上一次 channel 调用还没返回就叠加下一次。
     _pollTimer = Timer.periodic(const Duration(milliseconds: 100), (_) async {
       if (!mounted || !_cameraOpen || _polling) return;
       _polling = true;
       try {
-        final frame = await _ocr.pollResults();
+        final frame = await _det.pollResults();
         if (!mounted) return;
-        MatchResult? match;
-        if (_targetCode.isNotEmpty) {
-          match = PickupMatcher.findBest(_targetCode, frame.results);
-        }
+        // glyph_det 语义：模型只找查询目标，top1 即匹配结果
+        //（原生侧已按 score>0.5 + NMS 过滤）
+        final match = _targetCode.isNotEmpty ? frame.topBox : null;
         setState(() {
           _frame = frame;
           _match = match;
@@ -112,13 +115,21 @@ class _ScanPageState extends State<ScanPage> with TickerProviderStateMixin {
     });
   }
 
-  void _startSearch() {
+  Future<void> _startSearch() async {
     final code = _codeController.text.trim();
-    if (!PickupMatcher.isValidCode(code)) return;
+    if (!_isValidCode(code)) return;
     FocusScope.of(context).unfocus();
+    // 目标变更要重新渲染 mask 下发给原生侧，之后的每帧检测都针对新目标
+    final ok = await _det.setTargetCode(code);
+    if (!mounted) return;
+    if (!ok) {
+      debugPrint('setTargetCode failed');
+      return;
+    }
     setState(() {
       _targetCode = code;
       _hapticFired = false;
+      _match = null;
     });
     _history.add(code);
   }
@@ -129,7 +140,7 @@ class _ScanPageState extends State<ScanPage> with TickerProviderStateMixin {
   }
 
   Future<void> _toggleFlash() async {
-    final on = await _ocr.toggleFlash();
+    final on = await _det.toggleFlash();
     if (mounted) setState(() => _flashOn = on);
   }
 
@@ -139,20 +150,20 @@ class _ScanPageState extends State<ScanPage> with TickerProviderStateMixin {
     if (!_cameraOpen || _switchingCamera) return;
     setState(() => _switchingCamera = true);
     final next = _facing == 1 ? 0 : 1;
-    await _ocr.closeCamera();
-    final ok = await _ocr.openCamera(next);
+    await _det.closeCamera();
+    final ok = await _det.openCamera(next);
     if (!mounted) return;
     if (ok) {
       setState(() {
         _facing = next;
         _switchingCamera = false;
         _flashOn = false; // 新会话的闪光灯状态已重置
-        _frame = OcrFrame.empty;
+        _frame = GlyphDetFrame.empty;
         _match = null;
       });
     } else {
       // 打开失败回滚原相机
-      await _ocr.openCamera(_facing);
+      await _det.openCamera(_facing);
       if (mounted) setState(() => _switchingCamera = false);
     }
   }
@@ -167,7 +178,7 @@ class _ScanPageState extends State<ScanPage> with TickerProviderStateMixin {
     _pollTimer?.cancel();
     _pulseController.dispose();
     _codeController.dispose();
-    _ocr.closeCamera();
+    _det.closeCamera();
     super.dispose();
   }
 
@@ -182,7 +193,7 @@ class _ScanPageState extends State<ScanPage> with TickerProviderStateMixin {
       body: SizedBox.expand(
         child: Stack(
         children: [
-          // 相机预览（原生渲染，含全部检测框）
+          // 相机预览（原生渲染）
           if (_cameraOpen)
             Positioned.fill(
               child: LayoutBuilder(
@@ -190,14 +201,15 @@ class _ScanPageState extends State<ScanPage> with TickerProviderStateMixin {
                   final size = Size(constraints.maxWidth, constraints.maxHeight);
                   return Stack(
                     children: [
-                      const Positioned.fill(child: OcrCameraView()),
+                      const Positioned.fill(child: GlyphDetCameraView()),
                       if (_match != null)
                         Positioned.fill(
                           child: AnimatedBuilder(
                             animation: _pulseController,
                             builder: (context, _) => CustomPaint(
                               painter: TargetHighlightPainter(
-                                match: _match!,
+                                box: _match!,
+                                label: _targetCode,
                                 frame: _frame,
                                 viewSize: size,
                                 pulse: _pulseController.value,
@@ -354,7 +366,7 @@ class _ScanPageState extends State<ScanPage> with TickerProviderStateMixin {
                               Flexible(
                                 child: Text(
                                   _targetCode.isEmpty
-                                      ? '已识别 ${_frame.results.length} 处文字'
+                                      ? '输入取件码开始寻找'
                                       : (_match == null
                                           ? '正在寻找 $_targetCode …'
                                           : '已锁定目标'),
@@ -365,14 +377,13 @@ class _ScanPageState extends State<ScanPage> with TickerProviderStateMixin {
                                   ),
                                 ),
                               ),
-                              // 渲染帧率与管线耗时只在调试构建显示
+                              // 渲染帧率与推理耗时只在调试构建显示
                               if (kDebugMode)
                                 Padding(
                                   padding: const EdgeInsets.only(left: 10),
                                   child: Text(
                                     '${_frame.fps.toStringAsFixed(1)}FPS '
-                                    'D${_frame.detMs.toStringAsFixed(0)}/'
-                                    'R${_frame.recMs.toStringAsFixed(0)}',
+                                    '${_frame.inferMs.toStringAsFixed(0)}ms',
                                     style: const TextStyle(
                                       color: FrostColors.strokeBlue,
                                       fontSize: 12,
@@ -432,16 +443,21 @@ class _ScanPageState extends State<ScanPage> with TickerProviderStateMixin {
 }
 
 /// 目标高亮：霜月蓝圆角框 + 脉冲光晕 + 四角括号。
+///
+/// 坐标映射：原生侧已按输出窗口宽高比裁剪 ROI，这里按 BoxFit.cover
+/// 语义做等比缩放 + 居中（与插件 example 的映射一致）。
 class TargetHighlightPainter extends CustomPainter {
   TargetHighlightPainter({
-    required this.match,
+    required this.box,
+    required this.label,
     required this.frame,
     required this.viewSize,
     required this.pulse,
   });
 
-  final MatchResult match;
-  final OcrFrame frame;
+  final GlyphDetBox box;
+  final String label;
+  final GlyphDetFrame frame;
   final Size viewSize;
 
   /// 0..1 呼吸值
@@ -450,15 +466,16 @@ class TargetHighlightPainter extends CustomPainter {
   @override
   void paint(Canvas canvas, Size size) {
     if (frame.width <= 0 || frame.height <= 0) return;
-    final sx = viewSize.width / frame.width;
-    final sy = viewSize.height / frame.height;
-    final c = match.candidate;
+    final scale = math.max(
+        viewSize.width / frame.width, viewSize.height / frame.height);
+    final dx = (viewSize.width - frame.width * scale) / 2;
+    final dy = (viewSize.height - frame.height * scale) / 2;
     final pad = 8.0 + pulse * 6.0;
     final rect = Rect.fromLTRB(
-      c.left * sx - pad,
-      c.top * sy - pad,
-      c.right * sx + pad,
-      c.bottom * sy + pad,
+      box.left * scale + dx - pad,
+      box.top * scale + dy - pad,
+      box.right * scale + dx + pad,
+      box.bottom * scale + dy + pad,
     );
     final rrect = RRect.fromRectAndRadius(rect, const Radius.circular(12));
 
@@ -500,7 +517,7 @@ class TargetHighlightPainter extends CustomPainter {
     // 目标文本标签
     final textPainter = TextPainter(
       text: TextSpan(
-        text: match.candidate.text,
+        text: label,
         style: const TextStyle(
           color: Colors.white,
           fontSize: 16,
@@ -516,5 +533,8 @@ class TargetHighlightPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(TargetHighlightPainter old) =>
-      old.pulse != pulse || old.match != match || old.frame != frame;
+      old.pulse != pulse ||
+      old.box != box ||
+      old.label != label ||
+      old.frame != frame;
 }

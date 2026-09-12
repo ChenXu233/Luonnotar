@@ -565,17 +565,22 @@ def build_sample(rng, cfg, scene_fonts):
             tfonts[i] = scene_fonts[int(rng.integers(len(scene_fonts)))]
     # 1) 背景  2) 弹性形变(仅背景)
     scene = elastic(rng, gen_background(rng, S))
-    # 3) 文本贴片(target 严禁被遮挡/截断/不可读: 任何新文本覆盖已有 target 面积 >15%
-    #    即重试位置; target 贴片必须完整入框(留 PLACE_M 边距), 框内容不下则逐轮压低字高重渲;
-    #    target 按贴入处背景亮度校正墨色极性(或低对比), 重渲后重新钳位、入框优先;
-    #    干扰串允许出图截断(真实负样本), 但覆盖已有干扰 >60% 也重试(避免叠成浆糊))
+    # 3) 文本贴片。结构性防遮挡：干扰串先贴、target 后贴——后贴者像素压先贴者，
+    #    target 因此永不被干扰串覆盖（毒数据实锤：mvp4 全库 13.6% target 被后贴文本
+    #    盖 >5%，如 000156 被 hard-neg 盖 76%——根因是极性重渲换了 warp 几何却沿用
+    #    旧位置的覆盖检查；顺序倒置后该类遮挡在构造上不可能）。
+    #    target 完整入框(留 PLACE_M 边距)，框内容不下则逐轮压低字高重渲；
+    #    target 按贴入处背景亮度校正墨色极性(或低对比)，重渲后重新钳位、入框优先;
+    #    干扰串允许出图截断(真实负样本)，互叠 >60% 重试(避免叠成浆糊)
+    order = sorted(range(len(texts)), key=lambda i: texts[i][1])  # is_t=0 先贴
     PLACE_M = 0.03 * S
     FIT = S - 2 * PLACE_M - 2  # target 贴片可放下的最大宽/高(留 2px 取整余量)
     placed = []  # (文本四角 scene 坐标 4x2, is_target)
     boxes = []   # 已贴文本的轴对齐包围盒
     talphas = []  # 每个 target 的字形 alpha 掩码(供光度后的可读性终检)
     tinfo = []   # 每个 target 的构造信息 (low_contrast, bg_mean, bg_std), 调测用
-    for (text, is_t, is_hard), fp, card_f in zip(texts, tfonts, tcards):
+    for i in order:
+        (text, is_t, is_hard), fp, card_f = texts[i], tfonts[i], tcards[i]
         low_contrast = (rng.random() < 0.15) and not is_hard  # hard-neg 必须可读, 不走低对比
         th_cap = 44
         for _ in range(8):  # target 必须能完整入框: 放不下就压低字高重渲
@@ -601,7 +606,7 @@ def build_sample(rng, cfg, scene_fonts):
                 px = int(rng.uniform(0.08 * S, 0.92 * S) - pw / 2)
                 py = int(rng.uniform(0.08 * S, 0.92 * S) - ph / 2)
             bb = _aabb(tc + [px, py])
-            if not any(_cover_ratio(bb, ob) > (0.15 if t == 1 else 0.6) for ob, t in boxes):
+            if not any(_cover_ratio(bb, ob) > (0.02 if t == 1 else 0.6) for ob, t in boxes):
                 ok = True
                 break
         if not ok:
@@ -646,6 +651,10 @@ def build_sample(rng, cfg, scene_fonts):
                     warped2, tc2, _ = warp_patch(rng, patch2, rect2)
                     patch, warped, tc = patch2, warped2, tc2
                 bb = _aabb(tc + [px, py])
+        # 极性/低对比重渲会重新摇 warp（几何变了），覆盖检查必须按新几何重跑——
+        # mvp4 的毒数据根因就是这一步漏检（旧几何过了检查，新几何盖住了 target）
+        if any(_cover_ratio(bb, ob) > (0.02 if t == 1 else 0.6) for ob, t in boxes):
+            continue
         paste_rgba(scene, warped, px, py)
         placed.append((tc + [px, py], is_t))
         boxes.append((bb, is_t))

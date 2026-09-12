@@ -1,0 +1,28 @@
+name: glyph_det_example
+description: "Pickup-code scanner demo: renders a query mask for the entered code and highlights the matching label in the live camera frame."
+publish_to: "none"
+
+environment:
+  sdk: ^3.8.1
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  glyph_det:
+    path: ../
+
+  permission_handler: ^12.0.1
+  path_provider: ^2.1.5
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+flutter:
+  uses-material-design: true
+
+  assets:
+    - assets/models/glyphdet.param
+    - assets/models/glyphdet.bin

@@ -122,3 +122,56 @@
 - with cen 0.9515 / without 0.9481 / oracle cen 0.9320 → 概念天花板为负，移除定案
 - cen 预测 Pearson r=0.333（弱信号但非零），仅值 +0.003 AUROC；top-1 格点 94/100 变但指标不动
 - 注：v1 官方 eval 数据集是 datasets/mvp4/val（不是 mvp/val），工具默认值曾踩错
+
+## v2.2 终局（40ep 烧完，17.2h）：架构修复全部生效，fp 成唯一约束
+
+周期 eval：ep10 auroc 0.9539/fp 0.046 → ep40 auroc 0.9494/recall 0.876/fp 0.089（退火段 recall 爬坡，fp 回涨=记忆化老毛病）
+官方 1000 图终评（last.pt）：recall@0.5 0.8893（v1 0.8612）、auroc 0.9433（v1 0.9351）、top1 0.884、fp 0.1001（v1 0.097 没动）
+- recall_iou0.3 == recall@0.5（0.8893）：0.3/0.5 差距完全闭合，reg 钳位天花板根除 ✓
+- levelstat：三级全部有效工作且按字高桶分工（s4 抓 44/s8 抓 261/s16 抓 200），余弦依赖症根除 ✓
+- fppeek：63 fp 中 61 个 distr 型，分数 mean 0.722/max 0.998，人眼看几乎全是单字符变异近邻（08504→08534、F8676→F8646、4→69-18-817、5→8006676324）
+结论：检测侧（找得到、框得准）已解决；判别侧（逐字全等）就是"不看全体"病根的原形——单字全对就高分，一个错字不扣分。
+达标线 0.96/0.92/0.03 未达 → 主线转入 v3 per-char min 聚合头；ONNX 定版暂缓。best.pt=ep10（auroc 0.9539/fp 0.046/recall 0.645）留作判别-召回权衡参照。
+
+## 毒数据事件（2026-02-25，用户抓包）：13.6% target 被遮挡，合成器结构性修复
+
+- 用户从 fppeek 图抓到 000156：小 target 被后贴 hard-neg 覆盖 76%。全库审计：train 13.6% target 被后贴文本盖 >5%（>25% 的 5806 个、>50% 的 1985 个、全盖死的存在）
+- 根因：①target 先贴、干扰后贴，大干扰串可吞小 target；②极性/低对比重渲会重摇 warp 改几何，但覆盖检查用的是旧几何（洞在这）；③阈值 15% 本身就在容忍遮挡
+- 修复（core/synth.py）：干扰串先贴/target 后贴（结构性保证 target 永不被干扰串覆盖）+ 重渲后按新几何重跑覆盖检查（失败弃贴）+ target 覆盖阈值 0.15→0.02
+- 验证：修复后 300 张冒烟仅 3 例 5~7% 的 aabb 角部虚接（像素不相交，目检确认），真实遮挡 0
+- mvp4（毒）改名 datasets/mvp4_poisoned 留档；同 seed=42 全量重生成中 → 完成后开训 mvp_v2_3（其余配置不动，隔离数据变量）
+- 推论：v2.2 的 recall 0.889 是在 13.6% 毒监督下取得的；且"部分可见也开火"的毒标签可能就是 fp 习惯的来源之一——干净数据可能同时抬 recall 压 fp
+
+## 插件化启动（2026-02-25，用户裁决：GPU 熄火，先用当前模型做插件）
+
+- v2.2 last.pt 导出 ONNX：runs/mvp_v2_2/glyphdet.onnx 单文件 9.9MB fp32（reparam 后 2.40M 参数）
+  对拍 max|diff|≤3.2e-4；注意 torch.onnx dynamo 默认外链 .onnx.data 且 GBK 控制台需 PYTHONUTF8=1
+- 移植规范：docs/plugin-spec.md（模型契约/decode 同语义/runtime 选型/短板声明）
+- v3（per-char min 聚合头）转为纯设计待办；干净数据（bash-1mbybqxb 重生成中）完成后仅存档，不重训，等用户发话
+
+### 干净数据落地（mvp4 重生成，100k train + 1k val，92min CPU）
+- 审计：val 遮挡>5% 仅 0.27%（max 0.10）、train 抽样 2 万张 0.23%（max 0.39）——毒数据 13.6%→0.25%，残留均为 aabb 角部虚接级
+- datasets/mvp4_poisoned 留档；训练配置无需改动（路径同名）
+- 按用户裁决：不重训，仅存档备用
+
+### 训练规程调整（用户裁决）：未来 run epochs 40→30、eval_every 10→5
+理由：记忆化老毛病（退火段 fp 回涨）说明长日程收益递减；eval 加密到 5 轮 + best.pt 机制保证抓到最优点。GPU 仍冻结。
+
+
+## 插件落地 + App 换装（2026-02-25，子代理建插件 / 主代理装 App）
+
+### vendor/glyph_det 插件建成（ncnn 路线，弃 ORT）
+- ONNX→ncnn：pnnx 转出 glyphdet.param(17.7KB)+bin(9.75MB)；关键坑：pnnx 把 10 个 Reduction 层 axes 写成空数组，须手工 `-23303=0 `→`-23303=1,0 `（固化在 tools/convert_ncnn.sh，重转必查）
+- blob 映射：in0=scene / in1=mask / out0,1,2=stride4,8,16；ncnn vs ORT 前向 diff：score sigmoid ≤5.1e-3、decode 后 top1 框差 0.04px
+- Android 原生：NDK camera2 自管相机（移植自 fast_paddle_ocr）+ ncnn Vulkan 推理线程 + C++ decode（thr0.5/DFL reg_max24/ltrb/NMS0.4/max20，与 core/decode.py 同语义）；无 mask 时 detect 直接跳过（安全）
+- decode 宿主机对拍全 PASS：tests/parity/parity.exe（w64devkit g++14.2），ort/crafted/thresh 三组基准 max box diff ≤1.2e-4
+- example app 可构建（flutter analyze 零 issue，debug APK 177MB）；真机未验证（Vulkan 首载/infer_ms/帧率/letterbox 域差/ARM decode 对拍全待真机）
+
+### App 侧换装 glyph_det（OCR 路线退役为死代码，不删）
+- 根 pubspec 加 glyph_det path 依赖；fast_paddle_ocr 依赖保留（ocr_service.dart / pickup_matcher.dart 成未引用死代码，用户裁决不回撤）
+- 模型资产：glyphdet.param/bin 拷入 assets/models/（与 paddle 模型并存）
+- 新增 lib/ocr/glyph_det_service.dart（loadModel cpugpu=1 Vulkan 默认待实测 / setTargetCode 渲染 mask 下发 / 相机开关 / 轮询）+ lib/ocr/mask_render.dart（拷自插件 example，与训练侧 render_mask 同语义）
+- scan_page.dart 重写：OcrCameraView→GlyphDetCameraView；匹配语义从"OCR 全文+文本匹配"变为"模型直接定位查询串"，topBox 即匹配；高亮 painter 改 GlyphDetBox + BoxFit.cover 映射（与 example 一致）；调试行改 FPS+inferMs；无目标时状态"输入取件码开始寻找"
+- android/app/build.gradle.kts：ndkVersion 固定 29.0.14206865（与两插件对齐）+ packaging pickFirst libc++_shared.so（两插件各带一份，内容相同）
+- flutter analyze 零 issue；flutter build apk --debug 成功：app-debug.apk 254.6MB（双 ABI + 双引擎 + 双模型，debug 体型）
+- 待真机清单：install 后 logcat -s GlyphDetPerf 看 infer_ms/fps/Vulkan 首载；ARM decode 用 tests/parity ort case 对拍一次；mask 渲染域差（Flutter 段落近似 PIL getbbox）实拍确认；fp16 未开（性能不够再开，开了要重对拍）

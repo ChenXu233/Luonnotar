@@ -15,7 +15,9 @@ repositories {
 android {
     namespace = "com.luonnotar.luonnotar"
     compileSdk = flutter.compileSdkVersion
-    ndkVersion = flutter.ndkVersion
+    // 与 fast_paddle_ocr / glyph_det 两个原生插件的 NDK 版本对齐，
+    // 避免跨 NDK 的 STL 混链
+    ndkVersion = "29.0.14206865"
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
@@ -42,6 +44,17 @@ android {
             // TODO: Add your own signing config for the release build.
             // Signing with the debug keys for now, so `flutter run --release` works.
             signingConfig = signingConfigs.getByName("debug")
+        }
+    }
+
+    packaging {
+        jniLibs {
+            // fast_paddle_ocr 与 glyph_det 各自从同一 NDK 带出 libc++_shared.so，
+            // 内容相同，任取一份避免重复打包冲突
+            pickFirsts += listOf(
+                "lib/arm64-v8a/libc++_shared.so",
+                "lib/armeabi-v7a/libc++_shared.so",
+            )
         }
     }
 }

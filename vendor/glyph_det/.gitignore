@@ -1,0 +1,34 @@
+# Flutter/Dart
+.dart_tool/
+.packages
+build/
+.flutter-plugins
+.flutter-plugins-dependencies
+
+# Android native build artifacts
+android/.cxx/
+android/.gradle/
+example/android/.gradle/
+example/android/local.properties
+
+# parity test binary
+tests/parity/parity.exe
+
+# 第三方 Android SDK（vendor 上百 MB，不进 git）
+# 首次构建前运行 vendor/glyph_det/tools/fetch_android_deps.sh 拉取
+android/src/main/jni/ncnn-*/
+android/src/main/jni/opencv-mobile-*/
+
+# ncnn 转换产物（由 tools/convert_ncnn.sh 生成；主 app 用的是仓库根 assets/models/）
+example/assets/models/*.bin
+example/assets/models/*.param
+
+# example 的 Android/Flutter 构建产物（插件主代码位于 android/，example/ 仅为演示）
+example/.dart_tool/
+example/.flutter-plugins
+example/.flutter-plugins-dependencies
+example/build/
+example/android/.gradle/
+example/android/app/.cxx/
+example/android/app/build/
+example/android/local.properties

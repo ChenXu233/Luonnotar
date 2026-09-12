@@ -33,6 +33,8 @@ dependencies:
 
   fast_paddle_ocr:
     path: vendor/fast_paddle_ocr
+  glyph_det:
+    path: vendor/glyph_det
   permission_handler: ^12.0.1
   path_provider: ^2.1.5
   shared_preferences: ^2.5.3
