@@ -22,7 +22,7 @@ import yaml
 
 from glyphdet.core.dataset import GlyphDataset, imread_chw
 from glyphdet.core.decode import decode_outputs, has_cen
-from glyphdet.core.model import GlyphDet, build_model
+from glyphdet.core.model import GlyphDet, build_model, pair_grid
 
 
 def iou_matrix(a, b):
@@ -252,3 +252,109 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# ============================================================ v4：旋转框评估
+def rbox_iou(a, b):
+    """a (N,5), b (M,5) (cx,cy,w,h,θrad) → (N,M) 旋转 IoU。
+    cv2 RotatedRect 的角度与 synth 同约定（图像坐标 y 向下、顺时针正），单位度。"""
+    import math
+
+    def rr(box):
+        cx, cy, w, h, th = [float(v) for v in box]
+        return ((cx, cy), (max(w, 1e-3), max(h, 1e-3)), math.degrees(th) % 360.0)
+
+    out = np.zeros((len(a), len(b)), np.float32)
+    for i in range(len(a)):
+        for j in range(len(b)):
+            rv, pts = cv2.rotatedRectangleIntersection(rr(a[i]), rr(b[j]))
+            if rv == cv2.INTERSECT_NONE:
+                continue
+            if rv == cv2.INTERSECT_FULL:
+                inter = min(a[i][2] * a[i][3], b[j][2] * b[j][3])
+            else:
+                inter = cv2.contourArea(pts)
+            out[i, j] = inter / (a[i][2] * a[i][3] + b[j][2] * b[j][3] - inter + 1e-7)
+    return out
+
+
+@torch.no_grad()
+def quick_eval_v4(model, val_ds, cfg, device, n=300):
+    """v4 训练中期轻量评估：auroc/recall@0.5(旋转IoU)/top1/fp。
+    auroc = query@target框 分 vs [query@非target框 + 变异@target框] 分（pair BCE 的直接口径）。
+    eval mask 用 idx 定种子渲染（跨 epoch 可比）。"""
+    from glyphdet.core.decode import decode_rprops
+    from glyphdet.core.synth import hard_negative, render_mask_rgba
+
+    m, ec, d = cfg["model"], cfg["eval"], cfg["data"]
+    fonts = d.get("mask_fonts") or [d["mask_font"]]
+    idxs = np.linspace(0, len(val_ds) - 1, min(n, len(val_ds))).astype(int)
+    was_training = model.training
+    model.eval()
+
+    def render(text, seed):
+        rng = np.random.default_rng(seed)
+        img = render_mask_rgba(text, d["mask_font"], d["mask_height"],
+                               d["mask_max_width"], rng=rng, font_pool=fonts)
+        t = torch.from_numpy(img)[None, None]
+        w8 = (t.shape[-1] + 7) // 8 * 8
+        return torch.nn.functional.pad(t, (0, w8 - t.shape[-1])).to(device)
+
+    n_hit = n_target = n_pred = n_wrong = n_top1 = n_img_t = 0
+    tgt_scores, neg_scores = [], []
+    for idx in idxs:
+        scene, query, boxes, is_target = val_ds[int(idx)]
+        feats = model.extract(scene[None].to(device))
+        outs = model.prop_maps(feats)
+        rb, _ = decode_rprops(outs, m["strides"], m["reg_max"],
+                              ec["prop_threshold"], ec["nms_iou"])
+        mq = render(query, int(idx))
+        tpl = model.mask_enc(mq)
+        ink = model.matcher.ink_cols(mq)
+
+        def mscore(boxes_np, tpl_=tpl, ink_=ink):
+            if len(boxes_np) == 0:
+                return np.zeros(0, np.float32)
+            bt = torch.from_numpy(boxes_np).to(device)
+            strips = model.matcher.strips(feats[0], bt, jitter=False)
+            pairs = pair_grid(tpl_.shape[0], len(bt), device)
+            span = 8.0 * bt[:, 2] / bt[:, 3].clamp(min=1.0)
+            sig = torch.sigmoid(model.matcher.score(strips, tpl_, ink_, pairs,
+                                                    span=span[pairs[1]]))
+            return sig.cpu().numpy()
+
+        ps = mscore(rb)
+        boxes_np, tgt = boxes.numpy(), is_target.numpy()
+        gt_t = boxes_np[(tgt > 0.5) & (boxes_np[:, 2] > 1)]
+        gt_n = boxes_np[(tgt <= 0.5) & (boxes_np[:, 2] > 1)]
+        n_target += len(gt_t)
+        n_img_t += int(len(gt_t) > 0)
+        fin = ps >= ec["score_threshold"]
+        rb_f = rb[fin]
+        if len(rb_f):
+            iou_t = rbox_iou(rb_f, gt_t) if len(gt_t) else np.zeros((len(rb_f), 0))
+            for j in range(len(gt_t)):
+                if (iou_t[:, j] >= ec["iou_threshold"]).any():
+                    n_hit += 1
+            wrong = (iou_t.max(1) < 0.3) if len(gt_t) else np.ones(len(rb_f), bool)
+            n_pred += len(rb_f)
+            n_wrong += int(wrong.sum())
+            top = int(np.argmax(ps[fin]))
+            if len(gt_t) and iou_t[top].max() >= ec["iou_threshold"]:
+                n_top1 += 1
+        # auroc 口径：GT 框上的直接 pair 分
+        tgt_scores += list(mscore(gt_t))
+        neg_scores += list(mscore(gt_n))
+        mut = hard_negative(np.random.default_rng(int(idx) + 99991), query)
+        if mut != query and len(gt_t):
+            mqm = render(mut, int(idx) + 555)
+            neg_scores += list(mscore(gt_t, model.mask_enc(mqm),
+                                      model.matcher.ink_cols(mqm)))
+    if was_training:
+        model.train()
+    return {
+        "auroc": auroc(tgt_scores, neg_scores),
+        "recall": n_hit / max(n_target, 1),
+        "top1": n_top1 / max(n_img_t, 1),
+        "fp": n_wrong / max(n_pred, 1) if n_pred else 0.0,
+    }

@@ -1,10 +1,13 @@
-"""全合成训练数据生成器：掩码条件化字形检测（取件码检测）。
+"""全合成训练数据生成器：掩码条件化字形检测（取件码检测）v4。
 
 用法:
-    python core/synth.py --config experiments/mvp_baseline/config.yaml \
+    python core/synth.py --config experiments/mvp7_v4/config.yaml \
         [--split both|train|val] [--n N] [--seed S] [--workers W]
 
-产出: <out_dir>/{train,val}/{scene,mask}/NNNNNN.png + labels.jsonl
+产出: <out_dir>/{train,val}/scene/NNNNNN.png + labels.jsonl
+  v4 变更：mask 不落盘（dataset 用 render_mask_rgba 在线渲染透明墨迹）；
+  文本面内全角度旋转（60% 场景基准角±25° / 40% 全随机）；
+  labels boxes = 旋转框 (cx, cy, w, h, θrad)，θ=阅读方向角(图像坐标顺时针正)。
 合成顺序: 程序化背景 -> 背景弹性形变 -> 文本贴片(记录四角, target 完整入框+墨色极性校正)
           -> 全局透视(重投影四角, target 四角必在图内否则重采样) -> 光度增强(不动几何)
           -> target 可读性终检(字形 alpha 区 vs 环带灰度差 <25 级则重 roll)。
@@ -58,7 +61,7 @@ def gen_code(rng):
     if k < 0.95:
         sep = str(rng.choice([" ", "", "."]))
         return sep.join([_digits(rng, 1, 3), _digits(rng, 1, 2), _digits(rng, 3, 5)])
-    n = int(rng.integers(10, 12))  # 长尾: 10-11 字符(v3 槽位 mask 上限 12, 留 1 位给可能的连字符插入)
+    n = int(rng.integers(10, 17))  # 长尾: 10-16 字符(v4 变长 mask, 无槽位上限; 渲染 max_W 等比缩兜底)
     s = "".join(rng.choice(list(_LETTERS + _DIGITS), size=n))
     if rng.random() < 0.3:
         i = int(rng.integers(2, n - 1))
@@ -209,6 +212,35 @@ def render_mask_slots(text, font_path, H, W, rng=None, font_pool=None, K=12):
         sx = (start + j) * slot_w + (slot_w - nw) // 2
         canvas.paste(img, (sx, (H - nh) // 2))
     return np.array(canvas)
+
+
+def render_mask_rgba(text, font_path, H, max_W, rng=None, font_pool=None, jitter=True):
+    """v4 mask：整串渲染 -> 墨迹紧致裁剪 -> 等比缩放到墨高 H-8 -> 透明底自然宽画布。
+    返回 float32 (H, Wn) 墨迹覆盖率 [0,1]（即 alpha/255，墨迹=1 透明=0），Wn 自然宽。
+    不落盘：dataset/probe 在线渲染，消掉"白底 png 再后处理"的算力浪费与域差。
+    横向 ±10% 字宽抖动（jitter）：字体 advance 差异的域漂兜底（mask 由 App 渲染）。
+    font_pool 抖动同 render_mask。超 max_W 等比整体缩小（严禁单向压扁）。"""
+    stroke = 0
+    if font_pool and rng is not None:
+        font_path = font_pool[int(rng.integers(len(font_pool)))]
+        stroke = 1 if rng.random() < 0.3 else 0
+    font = _font(font_path, 96)
+    bb = font.getbbox(text, stroke_width=stroke)
+    w, h = max(1, bb[2] - bb[0]), max(1, bb[3] - bb[1])
+    img = Image.new("L", (w, h), 0)
+    ImageDraw.Draw(img).text((-bb[0], -bb[1]), text, font=font, fill=255,
+                             stroke_width=stroke, stroke_fill=255)
+    scale = (H - 8) / h
+    nw, nh = max(1, round(w * scale)), max(1, round(h * scale))
+    if jitter and rng is not None:
+        nw = max(1, round(nw * float(rng.uniform(0.9, 1.1))))
+    if nw > max_W:
+        s2 = max_W / nw
+        nw, nh = max_W, max(1, round(nh * s2))
+    img = img.resize((nw, nh), Image.LANCZOS)
+    canvas = Image.new("L", (nw, H), 0)
+    canvas.paste(img, (0, (H - nh) // 2))
+    return np.array(canvas, np.float32) / 255.0
 
 
 # ---------------------------------------------------------------- 背景
@@ -387,12 +419,14 @@ def render_text_patch(rng, text, font_path, ink=None, th_cap=44, polarity=None, 
     return patch, (ox, oy, tw, th), np.array(ga)
 
 
-def warp_patch(rng, patch, text_rect, extra=None):
-    """整 patch 随机旋转 ±12° + 错切 ±0.15 (cv2.warpAffine, 透明边界)。
+def warp_patch(rng, patch, text_rect, extra=None, ang_deg=None):
+    """整 patch 随机旋转 + 错切 ±0.15 (cv2.warpAffine, 透明边界)。
+    ang_deg 显式给定面内旋转角（度，图像坐标顺时针正）；None 时旧行为 ±12° 随机。
+    v4：调用方按"60% 场景基准角±25° / 40% 全随机 [0,360)"逐文本给角。
     extra: 随 patch 同矩阵变换的附加单通道图(target 纯字形 alpha)。
     返回 (warped RGBA ndarray, 变换画布坐标系下文本四角 4x2, warped_extra 或 None)。"""
     w, h = patch.size
-    ang = math.radians(float(rng.uniform(-12, 12)))
+    ang = math.radians(ang_deg if ang_deg is not None else float(rng.uniform(-12, 12)))
     shear = float(rng.uniform(-0.15, 0.15))
     ca, sa = math.cos(ang), math.sin(ang)
     A = np.array([[ca, -sa], [sa, ca]]) @ np.array([[1.0, shear], [0.0, 1.0]])  # 旋转·错切
@@ -429,6 +463,19 @@ def _aabb(corners):
     """四角 -> 轴对齐包围盒 [x1, y1, x2, y2]。"""
     return [float(corners[:, 0].min()), float(corners[:, 1].min()),
             float(corners[:, 0].max()), float(corners[:, 1].max())]
+
+
+def _rbox(corners):
+    """文本四角 [TL,TR,BR,BL] -> (cx, cy, w, h, theta) 旋转框。
+    theta = 阅读方向角（图像坐标 y 向下、顺时针正，弧度 ∈ [0, 2π)）；
+    w = 阅读方向边长（上下边均值），h = 垂直边长（左右边均值）。
+    全局透视造成的轻微非矩形由双边平均吸收。"""
+    tl, tr, br, bl = corners[0], corners[1], corners[2], corners[3]
+    dw = (tr - tl) + (br - bl)
+    theta = float(math.atan2(float(dw[1]), float(dw[0])) % (2 * math.pi))
+    w = (float(np.hypot(*(tr - tl))) + float(np.hypot(*(br - bl)))) / 2
+    h = (float(np.hypot(*(bl - tl))) + float(np.hypot(*(br - tr)))) / 2
+    return [float(corners[:, 0].mean()), float(corners[:, 1].mean()), w, h, theta]
 
 
 def paste_alpha(acc, alpha_img, px, py):
@@ -612,13 +659,20 @@ def build_sample(rng, cfg, scene_fonts):
     boxes = []   # 已贴文本的轴对齐包围盒
     talphas = []  # 每个 target 的字形 alpha 掩码(供光度后的可读性终检)
     tinfo = []   # 每个 target 的构造信息 (low_contrast, bg_mean, bg_std), 调测用
+    # v4 面内全角度: 场景基准角(模拟手机roll) + 逐文本角(60% 基准角±25° 相干, 40% 全随机)
+    base_ang = float(rng.uniform(0, 360))
     for i in order:
         (text, is_t, is_hard), fp, card_f = texts[i], tfonts[i], tcards[i]
         low_contrast = (rng.random() < 0.15) and not is_hard  # hard-neg 必须可读, 不走低对比
+        if rng.random() < 0.6:
+            ang = (base_ang + float(rng.uniform(-25.0, 25.0))) % 360.0
+        else:
+            ang = float(rng.uniform(0.0, 360.0))
         th_cap = 44
         for _ in range(8):  # target 必须能完整入框: 放不下就压低字高重渲
             patch, rect, ga = render_text_patch(rng, text, fp, th_cap=th_cap, card=card_f)
-            warped, tc, gaw = warp_patch(rng, patch, rect, extra=ga if is_t else None)
+            warped, tc, gaw = warp_patch(rng, patch, rect, extra=ga if is_t else None,
+                                         ang_deg=ang)
             ph, pw = warped.shape[:2]
             if not is_t or (pw <= FIT and ph <= FIT):
                 break
@@ -665,7 +719,8 @@ def build_sample(rng, cfg, scene_fonts):
                     for _ in range(4):
                         patch2, rect2, ga2 = render_text_patch(rng, text, fp, th_cap=th_cap,
                                                                card=card_f, **kw)
-                        warped2, tc2, gaw2 = warp_patch(rng, patch2, rect2, extra=ga2)
+                        warped2, tc2, gaw2 = warp_patch(rng, patch2, rect2, extra=ga2,
+                                                        ang_deg=ang)
                         tcmn2, tcmx2 = tc2.min(0), tc2.max(0)
                         lo_x, hi_x = PLACE_M - tcmn2[0], S - PLACE_M - tcmx2[0]
                         lo_y, hi_y = PLACE_M - tcmn2[1], S - PLACE_M - tcmx2[1]
@@ -681,7 +736,7 @@ def build_sample(rng, cfg, scene_fonts):
                 else:
                     patch2, rect2, _ = render_text_patch(rng, text, fp, th_cap=th_cap,
                                                          card=card_f, **kw)
-                    warped2, tc2, _ = warp_patch(rng, patch2, rect2)
+                    warped2, tc2, _ = warp_patch(rng, patch2, rect2, ang_deg=ang)
                     patch, warped, tc = patch2, warped2, tc2
                 bb = _aabb(tc + [px, py])
         # 极性/低对比重渲会重新摇 warp（几何变了），覆盖检查必须按新几何重跑——
@@ -703,22 +758,25 @@ def build_sample(rng, cfg, scene_fonts):
     scene, tcs, talphas = perspective(rng, scene, [c for c, _ in placed],
                                       must_inside=[i for i, (_, t) in enumerate(placed) if t == 1],
                                       extra_maps=talphas)
-    out_boxes, out_flags = [], []
+    out_boxes, out_flags, target_aabbs = [], [], []
     for corners, (_, is_t) in zip(tcs, placed):
+        rb = _rbox(corners)
         x1, y1, x2, y2 = _aabb(corners)
-        x1, y1 = min(max(x1, 0.0), float(S)), min(max(y1, 0.0), float(S))
-        x2, y2 = min(max(x2, 0.0), float(S)), min(max(y2, 0.0), float(S))
-        if (x2 - x1) * (y2 - y1) < 64.0:  # 面积 <64px² 或完全出图
-            continue
-        out_boxes.append([x1, y1, x2, y2])
+        cx1, cy1 = min(max(x1, 0.0), float(S)), min(max(y1, 0.0), float(S))
+        cx2, cy2 = min(max(x2, 0.0), float(S)), min(max(y2, 0.0), float(S))
+        if (cx2 - cx1) * (cy2 - cy1) < 64.0 or rb[2] < 8 or rb[3] < 8:
+            continue  # 可见面积 <64px² / 完全出图 / 退化框
+        out_boxes.append(rb)  # v4 标注 = 旋转框 (cx,cy,w,h,θ)
         out_flags.append(is_t)
+        if is_t:
+            target_aabbs.append([x1, y1, x2, y2])  # 遮挡块避让用(未 clip, 保守)
     if not any(f == 1 for f in out_flags):
         return _rej("target_lost_in_perspective")
     # 5)+6) 光度增强 + target 可读性终检(联合重 roll): 终检在最终像素上量每个 target 的
     #    字形 alpha 区与外圈 4px 环带灰度均值差, <25 级即人眼不可辨。薄笔画被模糊/低采样
     #    抹掉是光度参数的锅, 不该连累整样本——终检不过就换一组光度参数重来(最多 6 组),
     #    仍不过才整样重 roll(终检门仍是兜底: 任何环节把 target 搞瞎都出不去)。
-    tboxes = [b for b, f in zip(out_boxes, out_flags) if f == 1]
+    tboxes = target_aabbs
     pre = scene
     bad = "gate_low_delta"
     for _ in range(6):
@@ -747,16 +805,9 @@ def build_sample(rng, cfg, scene_fonts):
             break
     if bad is not None:
         return _rej(bad)
-    # mask: 整串 query 标准渲染(font_pool 非空时字体/字重抖动, 部署侧字体域漂兜底);
-    # mask_layout=slots 时走 v3 槽位渲染(逐字入槽+偶数化居中, 见 render_mask_slots)
-    if cfg.get("mask_layout") == "slots":
-        mask = render_mask_slots(query, cfg["mask_font"], cfg["mask_height"],
-                                 cfg["mask_width"], rng=rng,
-                                 font_pool=cfg.get("mask_fonts"))
-    else:
-        mask = render_mask(query, cfg["mask_font"], cfg["mask_height"], cfg["mask_width"],
-                           rng=rng, font_pool=cfg.get("mask_fonts"))
-    return query, mask, scene, out_boxes, out_flags
+    # v4: mask 不落盘——dataset/probe 用 render_mask_rgba 在线渲染(透明墨迹语义,
+    # 训练期字体/字重/字宽抖动还是免费增广); labels 只留 query 字符串。
+    return query, scene, out_boxes, out_flags
 
 
 def gen_one(task):
@@ -770,17 +821,15 @@ def gen_one(task):
             break
     if result is None:
         raise RuntimeError(f"样本 {task['idx']} 连续重 roll 失败")
-    query, mask_img, scene_img, boxes, flags = result
+    query, scene_img, boxes, flags = result
     name = f"{task['idx']:06d}"
     out = Path(task["out_dir"])
     # 写文件用 imencode + tofile(规避中文路径问题); scene 内部为 RGB, 转 BGR 保存。
     # 重试 5 次：盘满/存储池写失败曾以 "OSError: N requested and 0 written" 炸掉整批
     scene_png = cv2.imencode(".png", cv2.cvtColor(scene_img, cv2.COLOR_RGB2BGR))[1]
-    mask_png = cv2.imencode(".png", mask_img)[1]
     for attempt in range(5):
         try:
             scene_png.tofile(str(out / "scene" / f"{name}.png"))
-            mask_png.tofile(str(out / "mask" / f"{name}.png"))
             break
         except OSError:
             if attempt == 4:
@@ -788,8 +837,8 @@ def gen_one(task):
             time.sleep(2)
     return {
         "scene": f"scene/{name}.png",
-        "mask": f"mask/{name}.png",
-        "boxes": [[round(float(v), 1) for v in b] for b in boxes],
+        "boxes": [[round(float(v), 1) for v in b[:4]] + [round(float(b[4]), 3)]
+                  for b in boxes],  # v4 旋转框 (cx,cy,w,h,θrad)
         "is_target": [int(f) for f in flags],
         "query": query,
     }
@@ -811,22 +860,17 @@ def main():
     out_root = Path(dcfg["out_dir"])
     if not out_root.is_absolute():
         out_root = ROOT / out_root
-    # 起飞前磁盘检查：100k 张约 23G，余量 ×1.3；不足直接拒飞（盘满曾两次炸在 80% 处）
+    # 起飞前磁盘检查：v4 只写 scene（约 12G/100k 张），余量 ×1.3；不足直接拒飞
     import shutil as _shutil
     total_imgs = int(dcfg["train_size"]) + int(dcfg["val_size"])
-    need_gb = total_imgs * 240_000 * 1.3 / 2**30
+    need_gb = total_imgs * 120_000 * 1.3 / 2**30
     free_gb = _shutil.disk_usage(str(out_root.anchor or out_root)).free / 2**30
     if free_gb < need_gb:
         raise SystemExit(f"磁盘空间不足：预计需 {need_gb:.0f}G，仅剩 {free_gb:.0f}G")
-    cfg = {k: dcfg[k] for k in ("scene_size", "mask_height", "mask_width", "mask_font",
-                                "max_texts_per_scene", "hard_neg_prob",
+    cfg = {k: dcfg[k] for k in ("scene_size", "max_texts_per_scene", "hard_neg_prob",
                                 "target_count_range", "distractor_count_range")}
     if "hard_neg_count_range" in dcfg:  # 可选: 每场景 hard-neg 个数(覆盖 hard_neg_prob 伯努利)
         cfg["hard_neg_count_range"] = list(dcfg["hard_neg_count_range"])
-    if "mask_fonts" in dcfg:  # 可选: mask 字体池(字体/字重抖动增广)
-        cfg["mask_fonts"] = list(dcfg["mask_fonts"])
-    if "mask_layout" in dcfg:  # 可选: v3 槽位渲染(slots), 缺省整串渲染
-        cfg["mask_layout"] = dcfg["mask_layout"]
     splits = []
     if args.split in ("both", "train"):  # 训练池(不含 val held-out 字体)
         splits.append(("train", 0, dcfg["train_size"], list(dcfg["scene_fonts"])))
@@ -837,7 +881,6 @@ def main():
         n = args.n if args.n is not None else int(size)
         sdir = out_root / name
         (sdir / "scene").mkdir(parents=True, exist_ok=True)
-        (sdir / "mask").mkdir(parents=True, exist_ok=True)
         tasks = [dict(idx=i, seed=seed, split_tag=tag, cfg=cfg, fonts=fonts, out_dir=str(sdir))
                  for i in range(n)]
         t0 = time.perf_counter()

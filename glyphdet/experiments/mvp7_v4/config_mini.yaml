@@ -1,0 +1,106 @@
+# v4: 模型内部两段式（先选框再识别）+ 旋转框 + 在线变长 mask。
+# 数据 = datasets/mvp6（面内全角度旋转场景，旋转框标注，mask 不落盘）。
+# 架构：BackboneV2 + 无条件 FPN → PropHead(textness+ltrbDFL+sincos)
+#       → grid_sample rectify 规范化条带 → 墨列软 min 模板匹配（pair BCE 多查询监督）。
+seed: 42
+
+data:
+  out_dir: datasets/mvp6mini
+  train_size: 2000
+  val_size: 200
+  scene_size: 416
+  mask_height: 64
+  mask_max_width: 768
+  mask_font: "C:/Windows/Fonts/msyh.ttc"
+  mask_fonts:
+    - "C:/Windows/Fonts/msyh.ttc"
+    - "C:/Windows/Fonts/arial.ttf"
+    - "C:/Windows/Fonts/segoeui.ttf"
+    - "C:/Windows/Fonts/calibri.ttf"
+    - "C:/Windows/Fonts/tahoma.ttf"
+    - "C:/Windows/Fonts/verdana.ttf"
+  scene_fonts:
+    - "C:/Windows/Fonts/simhei.ttf"
+    - "C:/Windows/Fonts/simkai.ttf"
+    - "C:/Windows/Fonts/simfang.ttf"
+    - "C:/Windows/Fonts/simsun.ttc"
+    - "C:/Windows/Fonts/Deng.ttf"
+    - "C:/Windows/Fonts/arial.ttf"
+    - "C:/Windows/Fonts/arialbd.ttf"
+    - "C:/Windows/Fonts/ARIALN.TTF"
+    - "C:/Windows/Fonts/ariblk.ttf"
+    - "C:/Windows/Fonts/bahnschrift.ttf"
+    - "C:/Windows/Fonts/calibri.ttf"
+    - "C:/Windows/Fonts/calibrib.ttf"
+    - "C:/Windows/Fonts/cambria.ttc"
+    - "C:/Windows/Fonts/candara.ttf"
+    - "C:/Windows/Fonts/candarab.ttf"
+    - "C:/Windows/Fonts/corbel.ttf"
+    - "C:/Windows/Fonts/corbelb.ttf"
+    - "C:/Windows/Fonts/consola.ttf"
+    - "C:/Windows/Fonts/consolab.ttf"
+    - "C:/Windows/Fonts/cour.ttf"
+    - "C:/Windows/Fonts/courbd.ttf"
+    - "C:/Windows/Fonts/FRamd.ttf"
+    - "C:/Windows/Fonts/GOTHIC.TTF"
+    - "C:/Windows/Fonts/GOTHICB.TTF"
+    - "C:/Windows/Fonts/BKANT.TTF"
+    - "C:/Windows/Fonts/GARA.TTF"
+    - "C:/Windows/Fonts/GARABD.TTF"
+    - "C:/Windows/Fonts/impact.ttf"
+    - "C:/Windows/Fonts/micross.ttf"
+    - "C:/Windows/Fonts/segoeui.ttf"
+    - "C:/Windows/Fonts/segoeuib.ttf"
+    - "C:/Windows/Fonts/verdana.ttf"
+    - "C:/Windows/Fonts/tahoma.ttf"
+    - "C:/Windows/Fonts/georgia.ttf"
+    - "C:/Windows/Fonts/times.ttf"
+    - "C:/Windows/Fonts/trebuc.ttf"
+    - "C:/Windows/Fonts/trebucbd.ttf"
+    - "C:/Windows/Fonts/LeelawUI.ttf"
+    - "C:/Windows/Fonts/taile.ttf"
+    - "C:/Windows/Fonts/javatext.ttf"
+  val_held_out_fonts:
+    - "C:/Windows/Fonts/comic.ttf"
+    - "C:/Windows/Fonts/msjh.ttc"
+  max_texts_per_scene: 4
+  hard_neg_prob: 0.7
+  hard_neg_count_range: [1, 2]
+  target_count_range: [1, 2]
+  distractor_count_range: [0, 3]
+
+model:
+  arch: v4
+  in_size: 416
+  widths: [24, 48, 96, 160]
+  neck_ch: 96
+  tpl_ch: 32
+  reg_max: 24
+  strides: [4, 8, 16]
+  assign: height
+  strip_h: 8
+  strip_w: 128
+
+train:
+  run_name: mvp_v4_mini
+  epochs: 6
+  eval_every: 5
+  eval_n: 300
+  batch_size: 16
+  workers: 6
+  lr: 0.001
+  weight_decay: 0.0005
+  warmup_epochs: 3
+  mut_per_scene: 2
+  bg_neg_boxes: 2
+  loss:
+    text_weight: 1.0
+    reg_weight: 2.0
+    ang_weight: 0.5
+    pair_weight: 1.0
+
+eval:
+  score_threshold: 0.5
+  iou_threshold: 0.5
+  nms_iou: 0.4
+  prop_threshold: 0.3

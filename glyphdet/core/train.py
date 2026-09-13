@@ -17,9 +17,9 @@ import torch.nn.functional as F
 import yaml
 from torch.utils.data import DataLoader
 
-from glyphdet.core.dataset import GlyphDataset
+from glyphdet.core.dataset import GlyphDataset, collate_v4
 from glyphdet.core.decode import dfl_expect, has_cen
-from glyphdet.core.eval import quick_eval
+from glyphdet.core.eval import quick_eval, quick_eval_v4
 from glyphdet.core.model import GlyphDet, build_model, count_params
 
 
@@ -139,6 +139,117 @@ def compute_loss(model, scene, mask, targets, cfg):
     return total, parts
 
 
+def compute_loss_v4(model, scene, mq, mm, targets, boxes, kinds, cfg):
+    """v4：提案(textness focal + 框体系 DFL/L1 + sincos L1) + matcher pair BCE。
+    pair 监督（v3 失败复盘的核心修复）：真串×target框=1，真串×其他框=0，
+    变异串×所有框=0——"查询是变异"的方向首次被直接监督，无 margin 饱和问题。"""
+    m = cfg["model"]
+    lw = cfg["train"]["loss"]
+    reg_max = m["reg_max"]
+    k_mut = int(cfg["train"].get("mut_per_scene", 2))
+    feats = model.extract(scene)
+    outs = model.prop_maps(feats)
+    device = scene.device
+    text_sum = torch.zeros((), device=device)
+    reg_sum = torch.zeros((), device=device)
+    ang_sum = torch.zeros((), device=device)
+    n_pos_total = 0
+    for out, tgt, s in zip(outs, targets, m["strides"]):
+        B, _, H, W = out.shape
+        pos = tgt[:, 7] > 0.5
+        n_pos = int(pos.sum())
+        n_pos_total += n_pos
+        text_sum = text_sum + focal_sum(out[:, 0], tgt[:, 0], tgt[:, 8])
+        if n_pos:
+            preg = out[:, 1 : 1 + 4 * reg_max].reshape(B, 4, reg_max, H, W)
+            pred_logits = preg.permute(0, 3, 4, 1, 2)[pos]
+            reg_t = tgt[:, 1:5].permute(0, 2, 3, 1)[pos]
+            reg_sum = reg_sum + dfl_loss(pred_logits, reg_t, reg_max) * n_pos
+            ltrb = dfl_expect(pred_logits.reshape(n_pos, 4 * reg_max), reg_max)
+            reg_sum = reg_sum + F.smooth_l1_loss(ltrb, reg_t, reduction="sum")
+            pang = out[:, 1 + 4 * reg_max : 3 + 4 * reg_max].permute(0, 2, 3, 1)[pos]
+            ang_sum = ang_sum + F.smooth_l1_loss(
+                pang, tgt[:, 5:7].permute(0, 2, 3, 1)[pos], reduction="sum"
+            )
+    # matcher pair BCE：全 batch 汇总后三次调用（mask_enc/strips/score 各一次）。
+    # pair 列表 = 逐样本 (query+变异 mask) × (全部标注/bg 框)，标签 真串×target框=1 其余 0。
+    f2 = feats[0]
+    B = scene.shape[0]
+    Wg = max(mq.shape[-1], mm.shape[-1] if mm.numel() else 0)
+    all_masks, all_boxes, box_sample = [], [], []
+    pair_mi, pair_si, pair_y = [], [], []
+    for b in range(B):
+        kd, bb = kinds[b], boxes[b]
+        sel = (bb[:, 2] > 1) & (bb[:, 3] > 1) & (kd > -1.5)
+        if int(sel.sum()) == 0:
+            continue
+        gt, kd = bb[sel], kd[sel]
+        mb = [mq[b]]
+        for i in range(k_mut):
+            j = b * k_mut + i
+            if mm.numel() and j < len(mm):
+                mb.append(mm[j])
+        masks_b = torch.stack([F.pad(x, (0, Wg - x.shape[-1])) for x in mb], 0)
+        base_m = sum(len(t) for t in all_masks)
+        base_s = sum(len(t) for t in all_boxes)
+        all_masks.append(masks_b)
+        all_boxes.append(gt)
+        box_sample += [b] * len(gt)
+        for mi_ in range(len(masks_b)):
+            for si_ in range(len(gt)):
+                pair_mi.append(base_m + mi_)
+                pair_si.append(base_s + si_)
+                pair_y.append(1.0 if (mi_ == 0 and float(kd[si_]) > 0.5) else 0.0)
+    pair_sum = torch.zeros((), device=device)
+    n_pairs = len(pair_y)
+    if n_pairs:
+        masks_all = torch.cat(all_masks, 0)
+        boxes_all = torch.cat(all_boxes, 0)
+        tpl = model.mask_enc(masks_all)
+        ink = model.matcher.ink_cols(masks_all)
+        strips, boxes_used = model.matcher.strips(
+            f2, boxes_all, batch_idx=torch.tensor(box_sample, device=device),
+            jitter=model.training, return_boxes=True,
+        )
+        pair_si_t = torch.tensor(pair_si, device=device)
+        span = 8.0 * boxes_used[:, 2] / boxes_used[:, 3].clamp(min=1.0)  # 内容列数 8w/h
+        logits = model.matcher.score(
+            strips, tpl, ink,
+            (torch.tensor(pair_mi, device=device), pair_si_t),
+            span=span[pair_si_t],
+        )
+        labels = torch.tensor(pair_y, device=device)
+        pair_sum = F.binary_cross_entropy_with_logits(logits, labels, reduction="sum")
+    n_pos = max(n_pos_total, 1)
+    total = (
+        lw["text_weight"] * text_sum / n_pos
+        + lw["reg_weight"] * reg_sum / n_pos
+        + lw["ang_weight"] * ang_sum / n_pos
+        + lw["pair_weight"] * pair_sum / max(n_pairs, 1)
+    )
+    parts = dict(
+        text=(text_sum / n_pos).item(), reg=(reg_sum / n_pos).item(),
+        ang=(ang_sum / n_pos).item(), pair=(pair_sum / max(n_pairs, 1)).item(),
+        n_pos=n_pos_total,
+    )
+    return total, parts
+
+
+def _batch_loss(model, batch, cfg, device):
+    """按 arch 分发 batch 解包与损失（v4 六元组 vs 旧三元组）。"""
+    if cfg["model"].get("arch") == "v4":
+        scene, mq, mm, targets, boxes, kinds = batch
+        return compute_loss_v4(
+            model, scene.to(device), mq.to(device), mm.to(device),
+            [t.to(device) for t in targets], boxes.to(device), kinds.to(device), cfg,
+        )
+    scene, mask, targets = batch
+    return compute_loss(
+        model, scene.to(device), mask.to(device),
+        [t.to(device) for t in targets], cfg,
+    )
+
+
 def git_version():
     try:
         commit = subprocess.run(
@@ -172,6 +283,7 @@ def main():
         train_ds, batch_size=tc["batch_size"], shuffle=True,
         num_workers=0 if args.smoke else tc["workers"], pin_memory=True,
         drop_last=True, persistent_workers=not args.smoke,
+        collate_fn=collate_v4 if cfg["model"].get("arch") == "v4" else None,
     )
     opt = torch.optim.AdamW(model.parameters(), lr=tc["lr"], weight_decay=tc["weight_decay"])
     scaler = torch.amp.GradScaler("cuda", enabled=device == "cuda")
@@ -179,11 +291,9 @@ def main():
     if args.smoke:
         # 单 batch 过拟合：loss 必须显著下降，验证图连通与分配正确
         model.train()
-        scene, mask, targets = next(iter(loader))
-        scene, mask = scene.to(device), mask.to(device)
-        targets = [t.to(device) for t in targets]
+        batch = next(iter(loader))
         for step in range(200):
-            loss, parts = compute_loss(model, scene, mask, targets, cfg)
+            loss, parts = _batch_loss(model, batch, cfg, device)
             opt.zero_grad()
             loss.backward()
             opt.step()
@@ -219,14 +329,11 @@ def main():
     for epoch in range(total_epochs):
         model.train()
         ep_loss, ep_n = 0.0, 0
-        for scene, mask, targets in loader:
+        for batch in loader:
             for g in opt.param_groups:
                 g["lr"] = lr_at(step)
-            scene = scene.to(device, non_blocking=True)
-            mask = mask.to(device, non_blocking=True)
-            targets = [t.to(device, non_blocking=True) for t in targets]
             with torch.amp.autocast("cuda", enabled=device == "cuda"):
-                loss, parts = compute_loss(model, scene, mask, targets, cfg)
+                loss, parts = _batch_loss(model, batch, cfg, device)
             opt.zero_grad()
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
@@ -236,10 +343,15 @@ def main():
             ep_loss += loss.item()
             ep_n += 1
             step += 1
+        if cfg["model"].get("arch") == "v4":
+            pdetail = (f"text {parts['text']:.4f} reg {parts['reg']:.4f} "
+                       f"ang {parts['ang']:.4f} pair {parts['pair']:.4f}")
+        else:
+            pdetail = (f"match {parts['match']:.4f} reg {parts['reg']:.4f} "
+                       f"cen {parts['cen']:.4f} margin {parts['margin']:.4f}")
         msg = (
             f"epoch {epoch+1}/{total_epochs} loss {ep_loss/max(ep_n,1):.4f} "
-            f"match {parts['match']:.4f} reg {parts['reg']:.4f} cen {parts['cen']:.4f} "
-            f"margin {parts['margin']:.4f} n_pos {parts['n_pos']} lr {lr_at(step):.2e} "
+            f"{pdetail} n_pos {parts['n_pos']} lr {lr_at(step):.2e} "
             f"显存 {torch.cuda.max_memory_allocated()/2**30:.1f}G "
             f"用时 {time.time()-t0:.0f}s"
         )
@@ -249,7 +361,8 @@ def main():
         torch.cuda.reset_peak_memory_stats()
         torch.save({"model": model.state_dict(), "cfg": cfg}, run_dir / "last.pt")
         if val_ds is not None and ((epoch + 1) % eval_every == 0 or epoch + 1 == total_epochs):
-            r = quick_eval(model, val_ds, cfg, device, tc.get("eval_n", 300))
+            qe = quick_eval_v4 if cfg["model"].get("arch") == "v4" else quick_eval
+            r = qe(model, val_ds, cfg, device, tc.get("eval_n", 300))
             msg = (
                 f"  [eval@{epoch+1}] auroc {r['auroc']:.4f} recall {r['recall']:.4f} "
                 f"top1 {r['top1']:.4f} fp {r['fp']:.4f}"
@@ -257,6 +370,10 @@ def main():
             print(msg)
             log_f.write(msg + "\n")
             log_f.flush()
+            # 每 eval 一个断点（mini20 被杀全丢的教训；模型小，断点 ~8MB 无负担）
+            torch.save({"model": model.state_dict(), "cfg": cfg,
+                        "epoch": epoch + 1, "auroc": r["auroc"]},
+                       run_dir / f"ep{epoch+1}.pt")
             if r["auroc"] > best_auroc:
                 best_auroc = r["auroc"]
                 torch.save({"model": model.state_dict(), "cfg": cfg,

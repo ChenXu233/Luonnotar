@@ -436,6 +436,8 @@ class GlyphDetV2(nn.Module):
 def build_model(cfg):
     """按 cfg["model"]["arch"] 构造模型（缺省 v1，向后兼容）。"""
     arch = cfg["model"].get("arch")
+    if arch == "v4":
+        return GlyphDetV4(cfg)
     if arch == "v3":
         return GlyphDetV3(cfg)
     if arch == "v2":
@@ -651,6 +653,288 @@ class GlyphDetV3(nn.Module):
         w, tpl, valid = self.mask_enc(mask)
         p2, p3, p4 = self.backbone(scene)
         return self.head(self.neck(p2, p3, p4, w), w, tpl, valid)
+
+    def reparam(self):
+        """导出前调用：所有 RepVGGBlock 原地替换为融合后的部署形态。"""
+        for name, mod in list(self.named_modules()):
+            if isinstance(mod, RepVGGBlock):
+                parent = self
+                *path, attr = name.split(".")
+                for p in path:
+                    parent = getattr(parent, p) if not p.isdigit() else parent[int(p)]
+                if attr.isdigit():
+                    parent[int(attr)] = mod.fuse()
+                else:
+                    setattr(parent, attr, mod.fuse())
+
+
+# ============================================================ v4：内部两段式（先选框再识别）
+# v3 失败复盘（mutation_fp 0.80 / 分离 AUROC 0.594）：监督恒为 mask=真串、场景藏变异，
+# 模型从未被训过"查询是变异"的方向；槽位对齐被插入变异+容差池化吸收。
+# v4 设计：
+#   ① 提案 query 无关：PropHeadV4 出 textness + 框体系 ltrb(DFL) + sincos——
+#      "哪里有字符串"与"是不是这串"解耦，所有标注框（含 hard-neg/干扰）都是提案正样本。
+#   ② 识别 = rectify + 墨列软 min：按（预测/GT）框几何 grid_sample 规范化条带，
+#      模板互相关找全局最优对齐，readout 逐墨列余弦取 softmin——任何一笔墨对不上就死。
+#      留白不参与聚合（非墨列踢出 softmin、对齐分按墨列数归一），模型只能学字形。
+#   ③ pair BCE 多查询监督：同场景 真串×target框=1，真串×其他框=0，变异×所有框=0，
+#      两个方向都被监督，不再需要会饱和的 margin hack。
+import math as _math
+
+
+class ConvGNAct(nn.Module):
+    """mask 编码器专用：变长 padding 输入下 BN 统计不稳，用 GroupNorm。"""
+
+    def __init__(self, cin, cout, k=3, s=1, groups=8):
+        super().__init__()
+        self.conv = nn.Conv2d(cin, cout, k, s, k // 2, bias=False)
+        self.gn = nn.GroupNorm(min(groups, cout), cout)
+
+    def forward(self, x):
+        return F.silu(self.gn(self.conv(x)))
+
+
+class MaskEncoderV4(nn.Module):
+    """(B,1,64,Wm) → (B,Ct,8,Wm/8) 模板特征（Wm 为 8 的倍数，collate 保证）。"""
+
+    def __init__(self, tpl_ch=32, base=24):
+        super().__init__()
+        self.stem = nn.Sequential(
+            ConvGNAct(1, base, 3, 2),
+            ConvGNAct(base, base * 2, 3, 2),
+            ConvGNAct(base * 2, tpl_ch, 3, 2),
+        )
+        self.tpl = nn.Conv2d(tpl_ch, tpl_ch, 1)
+
+    def forward(self, m):
+        return self.tpl(self.stem(m))
+
+
+class NeckPlain(nn.Module):
+    """无 mask 条件的 FPN（v4 提案 query 无关，FiLM 随 v3 一起退役）。"""
+
+    def __init__(self, in_chs=(48, 96, 160), c=96):
+        super().__init__()
+        self.lat2 = nn.Conv2d(in_chs[0], c, 1, bias=False)
+        self.lat3 = nn.Conv2d(in_chs[1], c, 1, bias=False)
+        self.lat4 = nn.Conv2d(in_chs[2], c, 1, bias=False)
+        self.fuse2, self.fuse3, self.fuse4 = BasicBlock(c), BasicBlock(c), BasicBlock(c)
+
+    def forward(self, p2, p3, p4):
+        x4 = self.lat4(p4)
+        x3 = self.lat3(p3) + F.interpolate(x4, scale_factor=2, mode="nearest")
+        x2 = self.lat2(p2) + F.interpolate(x3, scale_factor=2, mode="nearest")
+        return self.fuse2(x2), self.fuse3(x3), self.fuse4(x4)
+
+
+class PropHeadV4(nn.Module):
+    """每级提案头：textness(1) + 框体系 ltrb DFL(4*reg_max) + sincos(2)。
+    输出通道布局 [textness, reg_dfl, sin, cos]。"""
+
+    def __init__(self, c=96, reg_max=24):
+        super().__init__()
+        self.reg_max = reg_max
+        self.convs = nn.ModuleList(ConvBNAct(c, c) for _ in range(3))
+        self.outs = nn.ModuleList(nn.Conv2d(c, 1 + 4 * reg_max + 2, 1) for _ in range(3))
+
+    def forward(self, feats):
+        return [self.outs[i](self.convs[i](f)) for i, f in enumerate(feats)]
+
+
+class MatcherV4(nn.Module):
+    """rectify + 墨列软 min 模板匹配（v4 判别核心）。
+
+    strips: 按框几何从 P2 采规范化条带——列/行间距 = h/8 场景像素（各向同性），
+      框内容映射为 ~8×(8w/h) 区域，周围留足对齐搜索余量；训练期框几何加抖
+      （±6% 中心 / ±20% 宽高 / ±4°）模拟预测框噪声，消 train/test 不一致。
+    score: 全局对齐分（墨列归一的互相关 logsumexp）+ 最优对齐处逐墨列余弦 softmin，
+      可学习两元混合出 logit。非墨列踢出 softmin——模型不知道"留白"为何物。
+    """
+
+    def __init__(self, neck_ch=96, tpl_ch=32, strip_h=8, strip_w=128,
+                 feat_stride=4, tau=0.25):
+        super().__init__()
+        self.proj = nn.Conv2d(neck_ch, tpl_ch, 1)
+        self.sh, self.sw = strip_h, strip_w
+        self.fs = feat_stride
+        self.tau = tau
+        self.mix = nn.Parameter(torch.tensor([1.0, 4.0, -2.0]))
+        # v4.2 覆盖度 hinge 权重（under/over），见 score 末尾
+        self.cov_w = nn.Parameter(torch.tensor([2.0, 2.0]))
+        # v4.1 多尺度对齐：条带/模板列距比实测 p5~p95 = 0.82~1.45（pitchcheck），
+        # 单平移 dx 对长串必然后半串失配（mini20 零分离根因 A）。
+        self.scales = (0.80, 0.89, 1.00, 1.12, 1.25, 1.40)
+
+    def ink_cols(self, mask):
+        """mask (m,1,H,Wm) → (m,Wm/8) 墨列 0/1（列最大 ink 池化 >0.3）。"""
+        colmax = mask.amax(dim=2).squeeze(1)  # (m,Wm)
+        pooled = F.avg_pool1d(colmax, kernel_size=8, stride=8)
+        return (pooled > 0.3).float()
+
+    def strips(self, f2, boxes, batch_idx=None, jitter=False, return_boxes=False):
+        """f2 (B,C,Hf,Wf)，boxes (n,5) 场景像素 (cx,cy,w,h,θ)，batch_idx (n,) 每条所属样本
+        → (n,Ct,sh,sw)。全向量化：一次 grid_sample 采完整批（v4prof：逐框循环曾 0.45s/step）。
+        return_boxes=True 时同时返回实际采样用框（jitter 后），供覆盖度 span 对齐。"""
+        dev = f2.device
+        proj = self.proj(f2)
+        Hf, Wf = proj.shape[2], proj.shape[3]
+        n = len(boxes)
+        if n == 0:
+            empty = torch.zeros(0, proj.shape[1], self.sh, self.sw, device=dev)
+            return (empty, boxes) if return_boxes else empty
+        if batch_idx is None:
+            batch_idx = torch.zeros(n, dtype=torch.long, device=dev)
+        if jitter:
+            boxes = boxes.clone()
+            boxes[:, 0] += (torch.rand_like(boxes[:, 0]) - 0.5) * 0.06 * boxes[:, 2]
+            boxes[:, 1] += (torch.rand_like(boxes[:, 1]) - 0.5) * 0.06 * boxes[:, 3]
+            boxes[:, 2] *= 1.0 + (torch.rand_like(boxes[:, 2]) - 0.5) * 0.2
+            boxes[:, 3] *= 1.0 + (torch.rand_like(boxes[:, 3]) - 0.5) * 0.2
+            boxes[:, 4] += (torch.rand_like(boxes[:, 4]) - 0.5) * _math.radians(4.0)
+        ys, xs = torch.meshgrid(
+            torch.arange(self.sh, device=dev), torch.arange(self.sw, device=dev),
+            indexing="ij",
+        )
+        ys, xs = ys.float()[None], xs.float()[None]  # (1,sh,sw)
+        sp = (boxes[:, 3] / self.sh).view(n, 1, 1)  # 场景像素/采样格（行列同距，保长宽比）
+        ou = (xs + 0.5 - self.sw / 2) * sp
+        ov = (ys + 0.5 - self.sh / 2) * sp
+        c = torch.cos(boxes[:, 4]).view(n, 1, 1)
+        s = torch.sin(boxes[:, 4]).view(n, 1, 1)
+        cx = boxes[:, 0].view(n, 1, 1)
+        cy = boxes[:, 1].view(n, 1, 1)
+        px = cx + c * ou - s * ov
+        py = cy + s * ou + c * ov
+        gx = (px / self.fs + 0.5) / Wf * 2 - 1
+        gy = (py / self.fs + 0.5) / Hf * 2 - 1
+        grid = torch.stack([gx, gy], -1)  # (n,sh,sw,2)
+        out = F.grid_sample(proj[batch_idx], grid, mode="bilinear",
+                            padding_mode="zeros", align_corners=False)
+        return (out, boxes) if return_boxes else out
+
+    def score(self, strips, tpl, ink, pairs, span=None):
+        """strips (n,Ct,sh,sw)，tpl (M,Ct,8,Wt)，ink (M,Wt)，
+        pairs = (mask_idx(P,), strip_idx(P,)) 显式配对，
+        span = (P,) 各 pair 条带框的内容列数 8w/h（覆盖度基准，可None跳过）→ match logit。
+        v4.1：特征中心化（异字余弦 0.97 坍塌根因 B）+ 多尺度对齐（列距失配根因 A）。
+        两遍法省显存：第一遍逐尺度 conv 找最优 (s*,dx*)，第二遍只对各尺度命中的
+        pair 子集重取窗口算逐墨列余弦。"""
+        mi, si = pairs
+        P = mi.shape[0]
+        M, Wt = tpl.shape[0], tpl.shape[3]
+        Ct = strips.shape[1]
+        dev = strips.device
+        # 中心化：消公共方向，恢复余弦动态范围
+        S = F.normalize(strips - strips.mean(1, keepdim=True), dim=1)
+        Tc = tpl - tpl.mean(1, keepdim=True)
+        Sp = F.pad(S, (0, 0, 1, 1))[si]  # (P,Ct,sh+2,sw)
+        g = P * Ct
+        Spf = Sp.reshape(1, g, self.sh + 2, self.sw)
+
+        def scaled_tpl(r):
+            Wr = max(8, int(round(Wt * r)))
+            if Wr > self.sw:  # 模板放大后比条带还宽：几何上不可能对齐，跳过该尺度
+                return None
+            Tr = F.interpolate(Tc, size=(self.sh, Wr), mode="bilinear",
+                               align_corners=False)
+            Tr = F.normalize(Tr, dim=1)
+            ikr = (F.interpolate(ink.view(M, 1, 1, Wt).float(), size=(1, Wr),
+                                 mode="bilinear", align_corners=False)
+                   .view(M, Wr) > 0.5).float()
+            return Tr, ikr, Wr
+
+        # 第一遍：逐尺度互相关，合并所有 (scale, dy, dx) 候选
+        Dmax = self.sw - 8 + 1
+        C = torch.full((P, len(self.scales), Dmax), -1e4, device=dev)
+        for k, r in enumerate(self.scales):
+            st = scaled_tpl(r)
+            if st is None:
+                continue  # C[:, k, :] 保持 -1e4，该尺度退出候选
+            Tr, ikr, Wr = st
+            Tk = (Tr * ikr.view(M, 1, 1, Wr))[mi]  # (P,Ct,sh,Wr)
+            R = F.conv2d(Spf, Tk.reshape(g, 1, self.sh, Wr), groups=g)
+            Dr = R.shape[3]
+            c = R.reshape(P, Ct, 3, Dr).sum(1).max(1).values  # (P,Dr) 行容差取 max
+            c = c / (ikr.sum(1).clamp(min=1.0)[mi].view(P, 1) * self.sh)
+            C[:, k, :Dr] = c
+        flat = C.view(P, -1)
+        # v4.2 align 改 hard max：logsumexp 的 τ·log(候选数) 熵膨胀对短模板（删除型
+        # 变异，dx 候选更多且子串完美对齐）系统性偏高，反判别；max 候选数不变量。
+        align = flat.max(1).values  # (P,)
+        best = flat.argmax(1)
+        ks, dxs = best // Dmax, best % Dmax
+
+        # 第二遍：最优尺度处逐墨列余弦（pad 到 Wmax 向量化，非墨列 +1e4 踢出聚合）
+        Wmax = max(8, int(round(Wt * max(self.scales))))
+        v = torch.full((P, Wmax), 1e4, device=dev)
+        spanink = torch.zeros(P, device=dev)  # 各 pair 最优尺度下的模板墨列数
+        arange_cache = {}
+        for k, r in enumerate(self.scales):
+            sel = ks == k
+            if not sel.any():
+                continue
+            Tr, ikr, Wr = scaled_tpl(r)
+            Tk = (Tr * ikr.view(M, 1, 1, Wr))[mi[sel]]  # (Ps,Ct,sh,Wr)
+            Ps = Tk.shape[0]
+            if Wr not in arange_cache:
+                arange_cache[Wr] = torch.arange(Wr, device=dev).view(1, Wr)
+            cols = (dxs[sel].view(Ps, 1) + arange_cache[Wr]).clamp(0, self.sw - 1)
+            win = torch.gather(S[si[sel]], 3,
+                               cols.view(Ps, 1, 1, Wr).expand(Ps, Ct, self.sh, Wr))
+            vv = (win * Tk).sum((1, 2)) / self.sh  # (Ps,Wr) 逐墨列余弦
+            vv = vv + (1.0 - ikr[mi[sel]]) * 1e4
+            v[sel, :Wr] = vv
+            spanink[sel] = ikr[mi[sel]].sum(1)
+        # v4.2 worst-k 聚合：softmin 的 -τ·log(N) 熵偏差把 colmin 全拖负且惩罚随串长
+        # 递增（变异串更短反而分高，反判别——零分离根因 C）。取最差 4 墨列均值：
+        # 变异 1 字≈连续 4-6 坏列直接命中；正例 worst-4 保持高分；无温度无计数偏差。
+        kw = min(4, Wmax)
+        colmin = torch.topk(v, kw, dim=1, largest=False).values.mean(1)  # (P,)
+        a, b, c0 = self.mix
+        logit = a * align + b * colmin + c0
+        if span is not None:
+            # 覆盖度双侧 hinge：删除型变异是子串（逐列匹配天然盲），靠
+            # 模板墨列跨幅/框内容列数(8w/h) 偏离 1 来杀（零分离根因 D）。
+            # span 须用实际采样框（训练期 jitter 后）。±15%/25% 余量吸收框回归噪声。
+            cov = spanink / span.clamp(min=8.0)
+            d1, d2 = self.cov_w
+            logit = logit - d1 * F.relu(0.85 - cov) - d2 * F.relu(cov - 1.25)
+        return logit.clamp(-32.0, 32.0)
+
+
+def pair_grid(m, n, device):
+    """m×n 全配对下标（评估用）：返回 (mask_idx, strip_idx)，行主序 reshape(m,n) 可还原。"""
+    mi = torch.arange(m, device=device).view(m, 1).expand(m, n).reshape(-1)
+    si = torch.arange(n, device=device).view(1, n).expand(m, n).reshape(-1)
+    return mi, si
+
+
+class GlyphDetV4(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        m = cfg["model"]
+        widths = tuple(m["widths"])
+        tpl_ch = m.get("tpl_ch", 32)
+        self.backbone = BackboneV2(widths=widths)
+        self.neck = NeckPlain(in_chs=(widths[1], widths[2], widths[3]), c=m["neck_ch"])
+        self.prop = PropHeadV4(c=m["neck_ch"], reg_max=m["reg_max"])
+        self.mask_enc = MaskEncoderV4(tpl_ch=tpl_ch)
+        self.matcher = MatcherV4(
+            neck_ch=m["neck_ch"], tpl_ch=tpl_ch,
+            strip_h=m.get("strip_h", 8), strip_w=m.get("strip_w", 128),
+        )
+        self.reg_max = m["reg_max"]
+        self.strides = m["strides"]
+
+    def extract(self, scene):
+        return self.neck(*self.backbone(scene))
+
+    def prop_maps(self, feats):
+        return self.prop(feats)
+
+    def forward(self, scene, mask=None):
+        """提案特征图（v4 提案 query 无关，mask 不进前向；匹配走 matcher.score）。"""
+        return self.prop_maps(self.extract(scene))
 
     def reparam(self):
         """导出前调用：所有 RepVGGBlock 原地替换为融合后的部署形态。"""

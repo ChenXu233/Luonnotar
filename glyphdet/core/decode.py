@@ -56,3 +56,46 @@ def decode_outputs(
     scores = torch.cat(all_scores)
     keep = torchvision.ops.nms(boxes, scores, nms_iou)[:max_det]
     return boxes[keep].cpu().numpy(), scores[keep].cpu().numpy()
+
+
+@torch.no_grad()
+def decode_rprops(outs, strides, reg_max, prop_thr=0.3, nms_iou=0.4, max_prop=32):
+    """v4 提案 decode：textness>thr 点 → 旋转框 (n,5) numpy + 提案分 numpy。
+    通道布局 [textness, reg_dfl(4*reg_max), sin, cos]；ltrb 在框体系（阅读方向轴）。
+    NMS 用 AABB（场景稀疏）；精读由 matcher 分数再筛。"""
+    all_rb, all_sc = [], []
+    for out, s in zip(outs, strides):
+        B, C, H, W = out.shape
+        score = torch.sigmoid(out[:, 0])
+        reg = out[:, 1 : 1 + 4 * reg_max].permute(0, 2, 3, 1).reshape(-1, 4 * reg_max)
+        ltrb = dfl_expect(reg, reg_max) * s
+        sincos = out[:, 1 + 4 * reg_max : 3 + 4 * reg_max].permute(0, 2, 3, 1).reshape(-1, 2)
+        th = torch.atan2(sincos[:, 0], sincos[:, 1])
+        ys, xs = torch.meshgrid(
+            torch.arange(H, device=out.device), torch.arange(W, device=out.device),
+            indexing="ij",
+        )
+        px = (xs.reshape(-1).float() + 0.5) * s
+        py = (ys.reshape(-1).float() + 0.5) * s
+        l, t, r, b = ltrb.unbind(1)
+        c, sn = torch.cos(th), torch.sin(th)
+        du, dv = (r - l) / 2, (b - t) / 2
+        cx = px + c * du - sn * dv
+        cy = py + sn * du + c * dv
+        rb = torch.stack([cx, cy, l + r, t + b, th], 1)
+        sc = score.reshape(-1)
+        keep = sc > prop_thr
+        if keep.any():
+            all_rb.append(rb[keep])
+            all_sc.append(sc[keep])
+    if not all_rb:
+        return np.zeros((0, 5), np.float32), np.zeros(0, np.float32)
+    rb = torch.cat(all_rb)
+    sc = torch.cat(all_sc)
+    aw = rb[:, 2] * rb[:, 4].cos().abs() + rb[:, 3] * rb[:, 4].sin().abs()
+    ah = rb[:, 2] * rb[:, 4].sin().abs() + rb[:, 3] * rb[:, 4].cos().abs()
+    aabb = torch.stack(
+        [rb[:, 0] - aw / 2, rb[:, 1] - ah / 2, rb[:, 0] + aw / 2, rb[:, 1] + ah / 2], 1
+    )
+    keep = torchvision.ops.nms(aabb, sc, nms_iou)[:max_prop]
+    return rb[keep].cpu().numpy(), sc[keep].cpu().numpy()

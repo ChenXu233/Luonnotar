@@ -223,3 +223,77 @@
 - 开训：task bash-ts7dma2y，`experiments/mvp6_v3/config.yaml`（arch v3 槽位版、30ep、eval_every 5、bs16、run mvp_v3），GPU 67%/6.1G 确认在跑。
 - 日志逐 epoch 写入 runs/mvp_v3/log.txt；首个 epoch 预计 ~31min，eval@5 约 2.5~3h 后可看。
 - go/no-go：eval@5/10 时跑 `tools/v3probe.py --weights runs/mvp_v3/last.pt --n 150`，门=mutation_fp≤2% 且官方 recall@0.5≥0.95、fp≤0.03（v2.2 基线 0.889/0.943/0.100）。
+
+## v3 全量训练完成——判定：NO-GO（第 8 窗口）
+- 30ep 跑满无 NaN，总耗时 59903s（16.6h），final loss 1.32。权重 runs/mvp_v3/last.pt。
+- 官方 eval@30：auroc 0.849 / recall 0.838 / top1 0.830 / fp 0.148——全线差于 v2.2（0.889/0.943/0.100）。
+- v3probe（n=150, mvp5/val）：pos_top1 0.811，pos_hit@0.5 0.873，**mut_max_mean 0.672，mut_max_p90 0.999，mutation_fp 0.80，separation_auroc 0.594**（门：mutation_fp≤2%）。插入型变异（Y49→Y469）0.961、（9-11-4872→9-11.48272）0.999。
+- 关键证据：**margin loss 从 epoch14 起恒为 0.0000**（训练自称完美分离），而实测 mutation_fp 80%——瓶颈在监督信号饱和度，不在架构表达力。hard-neg 是同字体同卡 1~2 次扰动（synth.py:131 hard_negative），但 margin 只约束"hard-neg 区单点 max < 正样本 mean - margin"，饱和后零梯度；且训练方向恒为 mask=真串/scene=变异，probe 方向（mask=变异/scene=真串）从未被监督；插入变异使槽对齐整体平移，容差 maxpool(11,5) 把平移吸收掉。
+- 结论：v3 min-agg 判别头未治好"不看全体"。候选路径：v3.1 监督修复（hard-neg 2~3 个/scene、margin 改 top-k 且不饱和、E2 逐字槽位 aux 监督指出"哪个字不同"）；或回 v2.2 先做插件集成、近邻 fp 交给多帧投票/用户确认。
+
+## v4 重构落地（第 9 窗口，进行中）——用户四点裁决驱动的全面重构
+用户四点要求：①场景任意角度+旋转框标注；②杀 mask 硬截断/槽位留白；③mask 真透明（不落盘，在线渲染）；
+④监督不做区域化字数（模型不知学留白还是字体→泛化差）。用户确认"内部两段式=先选框再识别"。
+
+### 已落地（全部验证过）
+- **synth v4**：warp_patch 加 ang_deg；build_sample 场景基准角+逐文本 60%相干±25°/40%全随机[0,360)；
+  标注=旋转框 (cx,cy,w,h,θrad)（_rbox() 由四角算，θ=阅读方向，y向下顺时针正）；mask 完全不落盘；
+  gen_code 长尾恢复 10-16 字。目检 12 张全过（含 180° 倒置、90° 竖排，框贴合、mask 透明紧致）。
+- **dataset v4**：labels 无 mask 键；在线 render_mask_rgba（synth.py 内，(H,Wn) float 墨迹=1 透明=0，
+  墨高 H-8、变长宽≤max_W、横向±10%字宽抖动）；训练返回 (scene,mq,muts,targets,boxes,kinds)，
+  kinds:1=target/0=非target/-1=bg随机框（matcher 负样本，不进分配）；targets 每级 9ch：
+  [textness,ltrb(框体系/stride),sincos,pos,weight]，所有标注框都是 textness 正样本；collate_v4 变长 pad(8倍数)。
+- **model v4**（model.py 尾部 v4 区段，arch="v4" 已注册）：BackboneV2+NeckPlain(无FiLM)→PropHeadV4
+  （99ch=[textness,ltrbDFL(4*24),sin,cos]）；MaskEncoderV4(GroupNorm,变长安全)→(Ct=32,8,Wt)；
+  MatcherV4.strips（grid_sample 规范化条带 8×128，列行同距 h/8，训练期框抖动）；
+  MatcherV4.score(strips,tpl,ink,pairs) 显式 pair 列表：全局对齐 logsumexp + 最优偏移处逐墨列余弦
+  softmin，mix(1,4,-2) 可学习；pair_grid 辅助。参数量 1.79M，图连通全绿无死参数。
+- **train v4**：compute_loss_v4（textness focal + DFL+smoothL1(ltrb) + smoothL1(sincos) + pair BCE
+  （真串×target=1 其余全 0，含变异×所有框——v3 缺失方向的直接监督，无 margin 饱和））；
+  _batch_loss 按 arch 分发；v4smoke.py 过。
+- **eval**：rbox_iou（cv2.rotatedRectangleIntersection，约定 7 项单测全过 tools/v4ioutest.py）；
+  quick_eval_v4（recall/top1/fp + auroc=query@target vs query@非target+变异@target）；
+  decode_rprops（AABB NMS）；tools/v4probe.py（go/no-go：mutation_fp≤2% 门）。
+- **性能修复**：初版逐样本循环 2.5s/step（smoke 超时误判为 hang）→ v4prof 定位 → 全向量化
+  （mask_enc 全批一次、strips 全批一次 grid_sample、score pair 列表一次 grouped conv+gather）。
+  向量化版 v4smoke 过，训练 smoke 进行中（bash-pjzwywlf）。
+- config：experiments/mvp7_v4/config.yaml（全量 mvp6）+ config_mini.yaml（mvp6mini 2k/6ep）+ config_peek.yaml。
+
+### 后续
+1. 训练 smoke 过 → mini 6ep 短训 → v4probe 判定（mutation_fp 门）
+2. mini 达标 → 全量 mvp6 数据生成（CPU ~40min，只写 scene ~12G）
+3. 全量训练 30ep **等用户一句话**（GPU 禁令未解除到 v4 全量）
+4. tools/_patch_build_model.py、v4prof.py、v4smoke.py、v4ioutest.py 为一次性/诊断脚本可留可删
+- 用户裁决：全量训练 25ep（非 30），eval_every 5 不变。config.yaml 已改（25ep 预估 ~24h @0.55s/step）。
+- 用户暂停（玩游戏）：mini20 训练 bash-swq6e90d 已 TaskStop，GPU 无残留进程。
+  断点状态：v4 全链路代码就绪并验证；mini 6ep=欠拟合信号（pos/mut 双低，mut_fp=0）；
+  恢复入口 = 重跑 mini20（experiments/mvp7_v4/config_mini20.yaml）→ v4probe 判定 → 全量。
+- 用户要求加断点：train.py 现在每次 eval 落 runs/<run>/ep{N}.pt（含 epoch+auroc）。
+  正在跑的 mini20 用的旧码不受影响（last.pt 仍逐 epoch 更新）；下次训练起生效。
+  附带收益：训练中可对任意 ep{N}.pt 跑 v4probe 做早期判定，不用等全量跑完。
+
+## v4.1 matcher 零分离根因解剖与修复（已实锤，复训中）
+
+**症状**：mini20（2k×20ep）检测侧收敛（reg 8.7→1.87，ang 0.55→0.14）但 matcher 零分离——
+train probe auroc 0.509（训练集上都不分离=结构性问题），recall 恒 0，旧 run 归档
+runs/_archive/mvp_v4_mini20_v40_zerosep。
+
+**解剖链**（tools/v4pairdump.py + tools/v4pitchcheck.py，数据实锤）：
+1. pairdump：正例与变异的墨列余弦无差（0.779 vs 0.789）、colmin 全负（正例常低于变异）、
+   align 恒 ~1.6-1.7 无区分、mix 参数几乎不动 → logit 恒负 → "全拒绝"盆地（BCE≈0.26）。
+2. 根因 A【列距失配】：条带列距=h/8 场景像素（~5.67 列/字），模板列距=mask 渲染器决定
+   （~5.03 列/字），比值 mean=1.128/std=0.197，64% 样本失配>10%、38.6%>20%。对齐只有
+   平移 dx 无缩放自由度 → 10-16 字长串累计漂移 1-3 字宽 → 正例必有"坏列" → colmin 被打负。
+3. 根因 B【特征各向异性】：训练后 mask_enc 异字平均特征余弦 mean=0.970 min=0.881——
+   巨大公共方向把余弦动态范围压扁，colmin 物理上无法区分变异字形。
+
+**修复（MatcherV4.score，model.py）**：
+1. 多尺度对齐搜索：模板特征按 6 尺度 {0.80,0.89,1.00,1.12,1.25,1.40}（覆盖实测失配
+   p5~p95=0.82~1.45）双线性插值后逐尺度 grouped-conv 相关，logsumexp 合并所有
+   (scale,dy,dx) 候选，argmax 最优尺度处取窗算逐墨列余弦 softmin。两遍法省显存。
+2. 特征中心化：normalize 前减 channel 维均值（S/T 两侧），杀掉公共方向。
+mask 渲染 jitter（±10% 宽抖）保留——由尺度搜索吸收，兼作中间尺度鲁棒性数据源。
+
+**验证**：smoke 200 步 pair loss 0.38→0.075（修复前同设置卡 0.26 平台期），全分量收敛，
+参数量不变 1.79M。mini20 复训中（runs/mvp_v4_mini20，日志 runs/_v41mini20_train.log），
+判门槛不变：pos_top1≥0.6 / mut_max≤0.3 / auroc≥0.9 / mutation_fp≤2%。
