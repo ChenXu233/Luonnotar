@@ -175,3 +175,51 @@
 - android/app/build.gradle.kts：ndkVersion 固定 29.0.14206865（与两插件对齐）+ packaging pickFirst libc++_shared.so（两插件各带一份，内容相同）
 - flutter analyze 零 issue；flutter build apk --debug 成功：app-debug.apk 254.6MB（双 ABI + 双引擎 + 双模型，debug 体型）
 - 待真机清单：install 后 logcat -s GlyphDetPerf 看 infer_ms/fps/Vulkan 首载；ARM decode 用 tests/parity ort case 对拍一次；mask 渲染域差（Flutter 段落近似 PIL getbbox）实拍确认；fp16 未开（性能不够再开，开了要重对拍）
+
+
+### 文档落地（2026-02-25）：真机测试计划 + v3 设计（纯设计待办）
+- docs/phone-test-plan.md：安装基线/管线性能门槛（Vulkan≤30ms、FPS≥20）/检测正确性用例（含近邻干扰专查）/mask 域差对照实验/交互回归/失败样本采集规程
+- docs/v3-design.md：逐字 min 聚合头——score = softmin_k R_k(y, x+kΔ)，单字变异结构性判死；推荐 A2 逐字光栅输入（chars (1,12,1,64,40)+nchar，字编码器 ~150K），A1 定距整串+静态切片做回退；逐字核计算量 120 vs 现整串 216 反而更小；decode 零改动；mutation 评测门 ≤2%；方案 B（ROI 判别头）为独立回退路径
+
+
+## v3 实施启动（2026-02-26，用户发话"直接来做v3"；mvp_v2_3 对照实验作废并入 v3）
+
+### 架构落地（model.py，对比设计稿有收敛，详见 v3-design.md 实施定稿节）
+- CharSlotEncoder：mask (B,1,64,384) 按 12 槽×(64×32) reshape 逐字编码 → 逐字模板 (B,12,48,8,4) + masked-mean 全局向量 w；槽有效性 = 墨迹均值 <0.98 在线判定
+- HeadV3：逐字 xcorr_slots（B·K·C 组 depthwise 一次算完）→ 容差 maxpool（sh4 (7,3)/sh8 (11,5)）→ 整数常量偏移表对齐（槽距 0.5 字高 × 偶数尺度 ⇒ 任意串长奇偶皆整数）→ 无效槽 +1e4 → masked softmin(τ=1.0) → 与 cos_map 融合
+- 分配/回归/损失/输出 97ch 与 v2.2 完全一致；train.py/dataset.py/decode 零改动
+- 冒烟全过：CPU 前向 97ch×3 级、backward OK、全白 mask 抑制（score≤-1.2）；参数量 2.03M（v2.2 2.40M）；GPU 单 batch 过拟合 loss 452k→121k
+- synth：新增 render_mask_slots（偶数化居中逐字入槽，tools/v3maskpeek.py 槽位几何断言+目检全过）；gen_code 长尾限长 ≤12；mask_layout=slots 配置开关；场景侧零改动
+- 实验配置 experiments/mvp6_v3/config.yaml（数据 datasets/mvp5、arch v3、30ep/eval5）；mini 变体 config_mini.yaml（mvp5mini 2k 样本 6ep）
+- mini 短训实测：显存 2.2G/8G 无 OOM 风险；首 epoch 136s/125 步系与全量数据重生成抢 CPU 所致（GPU 7%），干净步速待 regen 完成后复测
+- tools/v3probe.py：mutation 分离度探针（正例 top1 vs 一字变异全场最高分，出 mutation_fp/分离 AUROC/fp 样例）——全量训练的 go/no-go 门
+
+
+### v3 mini 首训 NaN 事件（2026-02-26，已定位已修）
+- 现象：mini 短训 epoch1-2 几乎不学（auroc 0.49），epoch3 起 loss NaN
+- 定位（tools/v3debug.py）：xcorr 响应本身 ±200 正常；**agg 里 -10001.8 穿透进 fuse**——出界槽读的 -1e4 填充经 1×1 fuse 权重符号随机翻转成 ±5000~6000 logit → 负样本 BCE 单项 ~6000、grad_norm 44 万（clip 前），AMP 下 scale 崩死 → NaN
+- 修复：_align_min 出口 `agg.clamp(-32, 32)`（-1e4 只在 softmin 内部，永不进 fuse）
+- 教训固化：**任何常量填充值都必须隔离在融合层之外**；fp32 50 步对照证明非结构性（fp32 无 NaN 且下降）
+- 数据重生成曾撞盘满（E: 98%，剩 20G；全量 mvp5 需 ~22G）：OSError 121802 requested and 0 written。处置见下条
+
+
+### v3 mini 重训验证（钳位修复后，全绿）
+- 6ep 全程无 NaN：loss 115→4.08，match 1.6→0.29，reg 2.4→1.38 稳步下降；显存 2.2G
+- 稳态 ~0.3s/step（首 epoch 49s 含 warmup；此前 136s 系与 regen 抢 CPU）→ 100k 全量预估 ~31min/ep、30ep ≈ 15.6h，与 v2.2 同量级
+- mini eval 数字（recall≈0）为 2k 样本 6ep 欠拟合的正常表现，不作判定依据；mutation 探针等全量训到 eval@5/@10 再跑
+- 腾盘：删 v1 时代旧库 datasets/mvp + mvp2（≈19.3G，合成可再生）；mvp4（干净整串版）/mvp4_poisoned/mvp5mini 保留
+- 下一步：腾盘完 → 全量 regen datasets/mvp5（100k+1k，~90min CPU）→ 直接开 30ep 全量训练（用户已授权 v3 全程）→ eval@5/10 跑 v3probe 看 mutation 分离度
+
+
+### 盘满事件收尾与 v3 导出预验证（2026-02-26）
+- 第二次 regen 在 ~80.6k 张处再次 "OSError: 0 written"（当时卷面剩 27G）——卷面空闲不可信（疑似薄分配存储池），处置 = 删真实数据块：mvp4_poisoned（毒数据存档，事件已记录于上文）+ mvp3（v1 时代），df 65G 可用
+- 教训固化（synth.py）：gen_one 写盘 5 次重试（间隔 2s）；main() 起飞前磁盘检查（预计需求 ×1.3 不足即拒飞）
+- Windows 下删大目录：`rm -rf`(git bash) 35min/16G，`cmd rmdir /s /q` ~6min/26G——后者快 5 倍+
+- v3 ONNX 导出预验证（随机权重链路模式）：三级输出对拍 max|diff| ≤ 1.9e-6，全静态图设计兑现（logsumexp/maxpool/slice/有效性掩码全部干净导出）
+- 第三次 regen 进行中（加固版，~90min），完成后直接开 30ep 全量训练 mvp_v3
+
+## v3 全量训练开训（第 8 窗口续）
+- 数据重生成第三次成功：datasets/mvp5 train 100000 + val 1000，labels 行数对齐，日志无 error，耗时 4108s。
+- 开训：task bash-ts7dma2y，`experiments/mvp6_v3/config.yaml`（arch v3 槽位版、30ep、eval_every 5、bs16、run mvp_v3），GPU 67%/6.1G 确认在跑。
+- 日志逐 epoch 写入 runs/mvp_v3/log.txt；首个 epoch 预计 ~31min，eval@5 约 2.5~3h 后可看。
+- go/no-go：eval@5/10 时跑 `tools/v3probe.py --weights runs/mvp_v3/last.pt --n 150`，门=mutation_fp≤2% 且官方 recall@0.5≥0.95、fp≤0.03（v2.2 基线 0.889/0.943/0.100）。

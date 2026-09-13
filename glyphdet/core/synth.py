@@ -58,7 +58,7 @@ def gen_code(rng):
     if k < 0.95:
         sep = str(rng.choice([" ", "", "."]))
         return sep.join([_digits(rng, 1, 3), _digits(rng, 1, 2), _digits(rng, 3, 5)])
-    n = int(rng.integers(10, 13))  # 长尾: 10-12 字符(真实取件码很少超 11 位)
+    n = int(rng.integers(10, 12))  # 长尾: 10-11 字符(v3 槽位 mask 上限 12, 留 1 位给可能的连字符插入)
     s = "".join(rng.choice(list(_LETTERS + _DIGITS), size=n))
     if rng.random() < 0.3:
         i = int(rng.integers(2, n - 1))
@@ -175,6 +175,39 @@ def render_mask(text, font_path, H, W, rng=None, font_pool=None):
     img = img.resize((nw, nh), Image.LANCZOS)
     canvas = Image.new("L", (W, H), 255)
     canvas.paste(img, (0, (H - nh) // 2))  # 左对齐, 垂直居中
+    return np.array(canvas)
+
+
+def render_mask_slots(text, font_path, H, W, rng=None, font_pool=None, K=12):
+    """v3 槽位渲染: 每字独占一个 (H×slot_w) 槽, 整串居中; 奇数长串尾部补一个空槽
+    (偶数化)——保证任意串长的每个字都落在槽中心, 模型侧聚合偏移表因此是与串长
+    无关的整数常量(见 model.py v3 注释)。字形等比缩放至墨高≤H-6 且墨宽≤slot_w-6,
+    槽内居中。黑字(0)白底(255)。font_pool 抖动同 render_mask。超过 K 字截断
+    (gen_code 已限长, 不会触发)。"""
+    slot_w = W // K
+    stroke = 0
+    if font_pool and rng is not None:
+        font_path = font_pool[int(rng.integers(len(font_pool)))]
+        stroke = 1 if rng.random() < 0.3 else 0
+    font = _font(font_path, 96)
+    canvas = Image.new("L", (W, H), 255)
+    chars = list(text)[:K]
+    n = len(chars)
+    if n == 0:
+        return np.array(canvas)
+    ne = n + (n & 1)          # 偶数化: 奇数串视为尾部多一个空槽
+    start = (K - ne) // 2     # 首字槽位
+    for j, c in enumerate(chars):
+        bb = font.getbbox(c, stroke_width=stroke)
+        w, h = max(1, bb[2] - bb[0]), max(1, bb[3] - bb[1])
+        img = Image.new("L", (w, h), 255)
+        ImageDraw.Draw(img).text((-bb[0], -bb[1]), c, font=font, fill=0,
+                                 stroke_width=stroke)
+        scale = min((H - 6) / h, (slot_w - 6) / w)
+        nw, nh = max(1, round(w * scale)), max(1, round(h * scale))
+        img = img.resize((nw, nh), Image.LANCZOS)
+        sx = (start + j) * slot_w + (slot_w - nw) // 2
+        canvas.paste(img, (sx, (H - nh) // 2))
     return np.array(canvas)
 
 
@@ -714,9 +747,15 @@ def build_sample(rng, cfg, scene_fonts):
             break
     if bad is not None:
         return _rej(bad)
-    # mask: 整串 query 标准渲染(font_pool 非空时字体/字重抖动, 部署侧字体域漂兜底)
-    mask = render_mask(query, cfg["mask_font"], cfg["mask_height"], cfg["mask_width"],
-                       rng=rng, font_pool=cfg.get("mask_fonts"))
+    # mask: 整串 query 标准渲染(font_pool 非空时字体/字重抖动, 部署侧字体域漂兜底);
+    # mask_layout=slots 时走 v3 槽位渲染(逐字入槽+偶数化居中, 见 render_mask_slots)
+    if cfg.get("mask_layout") == "slots":
+        mask = render_mask_slots(query, cfg["mask_font"], cfg["mask_height"],
+                                 cfg["mask_width"], rng=rng,
+                                 font_pool=cfg.get("mask_fonts"))
+    else:
+        mask = render_mask(query, cfg["mask_font"], cfg["mask_height"], cfg["mask_width"],
+                           rng=rng, font_pool=cfg.get("mask_fonts"))
     return query, mask, scene, out_boxes, out_flags
 
 
@@ -734,9 +773,19 @@ def gen_one(task):
     query, mask_img, scene_img, boxes, flags = result
     name = f"{task['idx']:06d}"
     out = Path(task["out_dir"])
-    # 写文件用 imencode + tofile(规避中文路径问题); scene 内部为 RGB, 转 BGR 保存
-    cv2.imencode(".png", cv2.cvtColor(scene_img, cv2.COLOR_RGB2BGR))[1].tofile(str(out / "scene" / f"{name}.png"))
-    cv2.imencode(".png", mask_img)[1].tofile(str(out / "mask" / f"{name}.png"))
+    # 写文件用 imencode + tofile(规避中文路径问题); scene 内部为 RGB, 转 BGR 保存。
+    # 重试 5 次：盘满/存储池写失败曾以 "OSError: N requested and 0 written" 炸掉整批
+    scene_png = cv2.imencode(".png", cv2.cvtColor(scene_img, cv2.COLOR_RGB2BGR))[1]
+    mask_png = cv2.imencode(".png", mask_img)[1]
+    for attempt in range(5):
+        try:
+            scene_png.tofile(str(out / "scene" / f"{name}.png"))
+            mask_png.tofile(str(out / "mask" / f"{name}.png"))
+            break
+        except OSError:
+            if attempt == 4:
+                raise
+            time.sleep(2)
     return {
         "scene": f"scene/{name}.png",
         "mask": f"mask/{name}.png",
@@ -762,6 +811,13 @@ def main():
     out_root = Path(dcfg["out_dir"])
     if not out_root.is_absolute():
         out_root = ROOT / out_root
+    # 起飞前磁盘检查：100k 张约 23G，余量 ×1.3；不足直接拒飞（盘满曾两次炸在 80% 处）
+    import shutil as _shutil
+    total_imgs = int(dcfg["train_size"]) + int(dcfg["val_size"])
+    need_gb = total_imgs * 240_000 * 1.3 / 2**30
+    free_gb = _shutil.disk_usage(str(out_root.anchor or out_root)).free / 2**30
+    if free_gb < need_gb:
+        raise SystemExit(f"磁盘空间不足：预计需 {need_gb:.0f}G，仅剩 {free_gb:.0f}G")
     cfg = {k: dcfg[k] for k in ("scene_size", "mask_height", "mask_width", "mask_font",
                                 "max_texts_per_scene", "hard_neg_prob",
                                 "target_count_range", "distractor_count_range")}
@@ -769,6 +825,8 @@ def main():
         cfg["hard_neg_count_range"] = list(dcfg["hard_neg_count_range"])
     if "mask_fonts" in dcfg:  # 可选: mask 字体池(字体/字重抖动增广)
         cfg["mask_fonts"] = list(dcfg["mask_fonts"])
+    if "mask_layout" in dcfg:  # 可选: v3 槽位渲染(slots), 缺省整串渲染
+        cfg["mask_layout"] = dcfg["mask_layout"]
     splits = []
     if args.split in ("both", "train"):  # 训练池(不含 val held-out 字体)
         splits.append(("train", 0, dcfg["train_size"], list(dcfg["scene_fonts"])))
