@@ -201,6 +201,8 @@ def compute_loss_v4(model, scene, mq, mm, targets, boxes, kinds, cfg):
                 pair_si.append(base_s + si_)
                 pair_y.append(1.0 if (mi_ == 0 and float(kd[si_]) > 0.5) else 0.0)
     pair_sum = torch.zeros((), device=device)
+    aux_sum = torch.zeros((), device=device)
+    n_pos_pairs = 0
     n_pairs = len(pair_y)
     if n_pairs:
         masks_all = torch.cat(all_masks, 0)
@@ -219,17 +221,31 @@ def compute_loss_v4(model, scene, mq, mm, targets, boxes, kinds, cfg):
             span=span[pair_si_t],
         )
         labels = torch.tensor(pair_y, device=device)
-        pair_sum = F.binary_cross_entropy_with_logits(logits, labels, reduction="sum")
+        # 正负 ~1:8：pos_weight 补偿，否则负例梯度质量 8× 把正例压在 p~0.6（v4.2 平衡态）
+        pw = torch.tensor(float(lw.get("pair_pos_weight", 1.0)), device=device)
+        pair_sum = F.binary_cross_entropy_with_logits(
+            logits, labels, pos_weight=pw, reduction="sum")
+        # v4.3 密集列监督：正例对（真串×target 框）GT 几何对齐处逐墨列上拉
+        pos_t = labels > 0.5
+        n_pos_pairs = int(pos_t.sum())
+        if n_pos_pairs and lw.get("aux_weight", 1.0) > 0:
+            aux_sum = model.matcher.aux_column_loss(
+                strips, tpl, ink,
+                (torch.tensor(pair_mi, device=device)[pos_t], pair_si_t[pos_t]),
+                boxes_used,
+            ) * n_pos_pairs
     n_pos = max(n_pos_total, 1)
     total = (
         lw["text_weight"] * text_sum / n_pos
         + lw["reg_weight"] * reg_sum / n_pos
         + lw["ang_weight"] * ang_sum / n_pos
         + lw["pair_weight"] * pair_sum / max(n_pairs, 1)
+        + lw.get("aux_weight", 1.0) * aux_sum / max(n_pos_pairs, 1)
     )
     parts = dict(
         text=(text_sum / n_pos).item(), reg=(reg_sum / n_pos).item(),
         ang=(ang_sum / n_pos).item(), pair=(pair_sum / max(n_pairs, 1)).item(),
+        aux=(aux_sum / max(n_pos_pairs, 1)).item(),
         n_pos=n_pos_total,
     )
     return total, parts
@@ -269,6 +285,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
     ap.add_argument("--smoke", action="store_true", help="单 batch 过拟合冒烟")
+    ap.add_argument("--resume", action="store_true",
+                    help="从 runs/<run_name>/last.pt 续训（含优化器/scaler/epoch/最优 auroc）")
     args = ap.parse_args()
     cfg = yaml.safe_load(open(args.config, encoding="utf-8"))
     tc = cfg["train"]
@@ -312,6 +330,20 @@ def main():
     eval_every = tc.get("eval_every", 0)
     val_ds = GlyphDataset(root / "val") if eval_every else None
     best_auroc = -1.0
+    start_epoch = 0
+    if args.resume:
+        ckpt_p = run_dir / "last.pt"
+        if ckpt_p.exists():
+            ck = torch.load(ckpt_p, map_location=device, weights_only=False)
+            model.load_state_dict(ck["model"])
+            if "opt" in ck:  # 旧格式 last.pt（无优化器态）则只恢复权重
+                opt.load_state_dict(ck["opt"])
+                scaler.load_state_dict(ck["scaler"])
+            start_epoch = int(ck.get("epoch", 0))
+            best_auroc = float(ck.get("best_auroc", -1.0))
+            print(f"resume: {ckpt_p} 从 epoch {start_epoch}/{tc['epochs']} 续训")
+        else:
+            print(f"resume: {ckpt_p} 不存在，从头训")
 
     total_epochs = tc["epochs"]
     steps_per_epoch = len(loader)
@@ -324,9 +356,9 @@ def main():
         p = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
         return tc["lr"] * 0.5 * (1 + math.cos(math.pi * p))
 
-    step = 0
+    step = start_epoch * steps_per_epoch  # 续训时 lr 调度按全局 step 对齐
     t0 = time.time()
-    for epoch in range(total_epochs):
+    for epoch in range(start_epoch, total_epochs):
         model.train()
         ep_loss, ep_n = 0.0, 0
         for batch in loader:
@@ -359,7 +391,9 @@ def main():
         log_f.write(msg + "\n")
         log_f.flush()
         torch.cuda.reset_peak_memory_stats()
-        torch.save({"model": model.state_dict(), "cfg": cfg}, run_dir / "last.pt")
+        torch.save({"model": model.state_dict(), "cfg": cfg, "epoch": epoch + 1,
+                    "opt": opt.state_dict(), "scaler": scaler.state_dict(),
+                    "best_auroc": best_auroc}, run_dir / "last.pt")
         if val_ds is not None and ((epoch + 1) % eval_every == 0 or epoch + 1 == total_epochs):
             qe = quick_eval_v4 if cfg["model"].get("arch") == "v4" else quick_eval
             r = qe(model, val_ds, cfg, device, tc.get("eval_n", 300))

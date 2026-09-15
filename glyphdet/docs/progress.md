@@ -297,3 +297,112 @@ mask 渲染 jitter（±10% 宽抖）保留——由尺度搜索吸收，兼作�
 **验证**：smoke 200 步 pair loss 0.38→0.075（修复前同设置卡 0.26 平台期），全分量收敛，
 参数量不变 1.79M。mini20 复训中（runs/mvp_v4_mini20，日志 runs/_v41mini20_train.log），
 判门槛不变：pos_top1≥0.6 / mut_max≤0.3 / auroc≥0.9 / mutation_fp≤2%。
+
+## v4.2 聚合层与覆盖度修复（复训中）
+
+**v4.1 结果**：auroc 0.58→0.71（门槛 0.9），recall 仍 ~0。但 pairdump 显示特征与对齐已修好：
+正例墨列余弦 min +0.46~+0.66（原 +0.16），变异错误列降至 -0.02，r* 分布合理（0.89~1.40）。
+剩余零分离由两个新实锤根因造成：
+
+4. 根因 C【softmin 熵偏差】：softmin ≈ min - τ·log(N)，τ=0.25/N≈45 → 固定 -0.95 惩罚；
+   且惩罚随串长递增——删除型变异串更短 → colmin 反而更高（'-35533' -0.055 vs 正例 -0.205，
+   完全反向）。且 τ 过软：44 列中 1 列坏到 0 仅降 0.07。
+5. 根因 D【无覆盖约束】：逐列匹配对子串天然盲——删除型变异（'LW25'/'-35533'）完美对齐
+   到正例子串，worst-k 下 p 仍 0.87+。align 的 logsumexp 熵膨胀对短模板还系统性偏高。
+
+**修复**：
+1. colmin：softmin → worst-4 均值（变异 1 字≈连续 4-6 坏列直接命中；无温度无计数偏差）。
+2. 覆盖度双侧 hinge：cov=最优尺度墨列数/(8w/h)，relu(0.85-cov)/relu(cov-1.25) 可学习惩罚
+   （cov_w 参数）；span 用 strips 实际采样框（训练 jitter 后，新增 return_boxes）。
+3. align：logsumexp → hard max（候选数不变量，消熵膨胀）。
+调用点接线：train.py（jitter 框 span）、eval.py、v4probe.py。smoke pair loss 0.038
+（v4.1 0.068 / v4.0 卡 0.26）。v4.1 run 归档 runs/_archive/mvp_v4_mini20_v41_partial。
+复训 runs/mvp_v4_mini20（日志 runs/_v42mini20_train.log），判门槛不变。
+
+## v4.3 GT 几何对齐密集列监督（复训中）
+
+**v4.2 结果**：auroc 0.71→0.84（门槛 0.9），recall 仍 ~0.01。pairdump + 几何核验显示：
+模型自选对齐已达 GT 精度（'LW205' r_true 1.24 vs r* 1.25，dx_true 45.5 vs dx* 46）——
+对齐不再是瓶颈；瓶颈是特征区分度（正例 worst-4 仅 0.24-0.46），pair BCE 经 mix→worst-4
+每对只 4 列拿梯度，信号太稀疏推不动。
+
+**v4.3**：新增 MatcherV4.aux_column_loss——正例对 GT 几何免费精确（Wr=8w/h 内容列数、
+dx=(sw-Wr)/2 居中），在最优几何处对每根墨列 relu(0.85-v) 上拉，一对 ~40 列梯度（10×
+密度）。负例不下压（避免误伤变异对同字列；删除型由覆盖度 hinge 负责，替换/重排由 BCE
+经 worst-k 自动瞄准）。配置 aux_weight=1.0（三个 config 均加）。
+
+**埋雷记录**：aux 首版梯度 1e-8 恒 0.85 不动——gather 索引 `expand(Ps,-1,sh,gw)` 的 -1
+保持通道维为 1，只采第 0 通道；广播乘后 v 只剩跨通道和（中心化恒 0），梯度被中心化
+雅可比 (I-11^T/C) 精确湮灭。修复=expand 显式通道数（score 内对应 gather 本就显式 Ct，
+仅 aux 中招）。tools/v4auxgrad*.py 为定位留档。修复后 smoke aux 0.85→0.011。
+复训 runs/mvp_v4_mini20（日志 runs/_v43mini20_train.log）；v4.2 run 归档
+runs/_archive/mvp_v4_mini20_v42_auroc084。
+
+## v4.3 首训倒退与 aux pad bug（修复复训中）
+
+**v4.3 首训 auroc 0.56（倒退于 v4.2 的 0.84）**——aux 监督坐标全错：训练批 mask 被
+collate pad 到 batch 最大宽（10 字 query 混 16 字批墨只占 60%），aux 把整个 padded
+模板插值到 Wr 列再按居中假设上拉，墨迹实际被挤在前 60%，上拉位置全偏。score 主路径
+无此问题（pad 列被 ink 掩乘归零，对齐搜索自由定位）。
+修复：aux 内逐 mask 按墨右界裁剪（right=Wt-flip(ink).argmax）再插值缩放。
+tools/v4auxgrad.py 回归：tpl/strips 梯度 0.72/0.82 健康。smoke aux→0.011 pair→0.052。
+复训 runs/mvp_v4_mini20（日志 runs/_v43b_mini20_train.log）；倒退版归档
+runs/_archive/mvp_v4_mini20_v43_padbug。
+
+## v4.4 aux 坍塌定案与回撤（复训中）
+
+**v4.3b（裁剪修复后）auroc 0.70，仍倒退**。pairdump 定案：aux 纯上拉造成特征完全坍塌——
+所有墨列余弦被推上 ~0.9，正例/变异无差（mean 同为 0.914，变异 min 0.865 > 正例 0.847），
+mix 自杀（a→-0.108，c0→-3.089）退回全拒绝。机制：上拉 40 列/对 vs BCE 下压 4 列/对，
+梯度力量悬殊，平衡解=万物皆匹配。**教训：无上拉无下压配对则不如不做**。
+（对比学习式位置锐化下压留作备选——同字重复列混淆问题需谨慎。）
+
+**v4.4（回撤+两条便宜修正）**：
+1. aux_weight=0（代码留档对照用，>0 才计算）。
+2. pair BCE pos_weight=4.0（正负 ~1:8，负例梯度质量 8× 是 v4.2 正例卡 p~0.6 的直接成因）。
+3. tpl_ch 32→64（32ch×8 行对 39 款字体的字形恒等性太薄）。
+smoke 全绿。复训 runs/mvp_v4_mini20（日志 runs/_v44mini20_train.log）；
+坍塌版归档 runs/_archive/mvp_v4_mini20_v43b_collapse。
+
+## v4.4 mini20 判定与 mini40/全量数据并行
+
+**v4.4 mini20**：eval auroc 0.82（≈v4.2 的 0.84），但 pos_weight 解开正例压制：
+recall 0.015→0.30、top1 0.02→0.36，且 ep20 lr 归零时仍在爬——mini 撞的是 lr 调度
+天花板而非数据信息量天花板。v4probe（严格逐图判定，gate pos≥0.6/mut≤0.3/auroc≥0.9/
+mut_fp≤2%）：pos_top1 0.49 / mut_max 0.44 / auroc 0.62 / mut_fp 36%——未达门但差距收敛中。
+
+**并行两路**：① config_mini40.yaml（40ep 验证未收敛假设，GPU ~35min，日志
+runs/_v44mini40_train.log）；② 全量 mvp6 数据生成启动（100k train+1k val，纯 CPU，
+日志 runs/_mvp6full_gen.log，~12GB）。全量 25ep 训练仍等用户一句话。
+- 全量 mvp6 已生成完毕并核验：train 100000 + val 1000（labels.jsonl 行数一致），19GB。
+  生成日志 runs/_mvp6full_gen.log。
+- mini40 判定：auroc 0.83 / recall 0.26 / top1 0.28 @ep40，与 mini20（0.82/0.30/0.36）
+  持平——“lr 未收敛”假设证伪，2k mini 数据信息量见顶（auroc 高原 0.78-0.83）。
+  结论：结构修复已尽（6 缺陷全修），剩余杠杆=数据量（2k→100k，50×）。
+  mini40 run 在 runs/mvp_v4_mini40（日志 runs/_v44mini40_train.log）。
+  **下一步待用户发话：全量 25ep 训练（预估 ~24h GPU，0.59s/step 实测）。**
+
+## 用户重启电脑：训练已安全停下 + train.py 新增 --resume
+
+- 用户要求停训练重启：全量训练任务（bash-b6mpyamd）已 TaskStop，3h 巡检 cron 已删。
+  停时 epoch 1 未完成，无断点损失（断点只在 eval 时落）。
+- train.py 新增 `--resume`：last.pt 现含 model+opt+scaler+epoch+best_auroc，续训恢复
+  优化器/调度（lr 按全局 step 对齐，step=start_epoch×steps_per_epoch）；旧格式 last.pt
+  （无 opt）自动降级为只恢复权重。逻辑已单测（伪 epoch=7 断点正确续到 7）。
+- **重启后恢复命令**（在 E:/git/Luonnotar/glyphdet 下）：
+  PYTHONUTF8=1 PYTHONPATH=E:/git/Luonnotar pdm run python -m glyphdet.core.train \
+    --config experiments/mvp7_v4/config.yaml --resume > runs/_v44full_train.log 2>&1
+
+## v4.4 全量 25ep 训练收官（batch 8，~25.5h）
+
+最终 eval@25：auroc 0.9725 recall 0.9210 top1 0.9067 fp 0.0952。
+v4probe（ep25，150 图）：pos_top1 0.882 / pos_hit@IoU0.5 0.973 / mut_max 0.263（门≤0.3 ✅）
+/ separation_auroc 0.952（门≥0.9 ✅）/ mutation_fp 24.7%（门≤2% ❌ 固定0.5阈值的结构性
+尾部重叠，非排序问题）。断点 runs/mvp_v4/ep{5,10,15,20,25}.pt + best.pt + last.pt。
+
+**操作点表**（tools/v4rocscan.py，300 图，recall=top1≥thr 且 IoU≥0.5）：
+fp10%→recall 81.7%（thr 0.784）；fp5%→65.3%（0.887）；fp2%→45.3%（0.936）；
+fp1%→32.3%（0.958）。固定 thr0.5→recall 90.7%/fp 21%。
+注意：变异负样本是 1 字编辑距离的对抗样本，是现实里最坏的错认情形；App 真实错认对象
+（他人随机取件码）远弱于变异——同阈值下真实 fp 会显著低于此表。
+mini 全系列（2k 数据，auroc 高原 0.83）到全量的差距证实数据量是最终杠杆。

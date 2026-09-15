@@ -82,15 +82,15 @@ model:
   strip_w: 128
 
 train:
-  run_name: mvp_v4_mini
-  epochs: 6
+  run_name: mvp_v4_mini40
+  epochs: 40
   eval_every: 5
   eval_n: 300
   batch_size: 16
   workers: 6
   lr: 0.001
   weight_decay: 0.0005
-  warmup_epochs: 3
+  warmup_epochs: 40
   mut_per_scene: 2
   bg_neg_boxes: 2
   loss:

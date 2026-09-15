@@ -901,6 +901,60 @@ class MatcherV4(nn.Module):
             logit = logit - d1 * F.relu(0.85 - cov) - d2 * F.relu(cov - 1.25)
         return logit.clamp(-32.0, 32.0)
 
+    def aux_column_loss(self, strips, tpl, ink, pos_pairs, boxes_used):
+        """正例对 GT 几何对齐处的逐墨列上拉损失（v4.2 密集特征监督）。
+
+        动机：pair BCE 经 mix→worst-4 每对只 4 列拿梯度，推不动特征区分度
+        （正例 worst-4 卡 0.24-0.46）。GT 几何免费且精确：框内容列数 Wr=8w/h，
+        模板缩放至墨跨幅=Wr 后 dx=(sw-Wr)/2 居中——在此对每根墨列上拉到 0.85，
+        一对 ~40 列梯度。负例不在此下压（会误伤变异对的同字列，BCE 经 worst-k
+        自动瞄准变异区，分工即可）。"""
+        mi, si = pos_pairs
+        if mi.numel() == 0:
+            return strips.new_zeros(())
+        dev = strips.device
+        S = F.normalize(strips - strips.mean(1, keepdim=True), dim=1)
+        Tc = tpl - tpl.mean(1, keepdim=True)
+        Wt = tpl.shape[3]
+        # 模板墨右界（开区间）：训练批 mask 被 collate pad 到 batch 最大宽，pad 列
+        # 若参与 interpolate 会把墨迹挤歪（10 字 query 在 16 字批里墨只占 60%），
+        # 上拉坐标全错——v4.3 首训 auroc 倒退 0.84→0.56 即此因。逐 mask 裁剪再缩放。
+        right = Wt - (ink > 0.5).int().flip(1).argmax(1)  # (M,)
+        w = boxes_used[si, 2]
+        h = boxes_used[si, 3].clamp(min=1.0)
+        Wr = (8.0 * w / h).round().long().clamp(min=8, max=self.sw)  # (P,) 内容列数
+        loss_sum, col_cnt = strips.new_zeros(()), 0
+        for m_i in mi.unique():
+            pm = mi == m_i
+            r_ = int(right[m_i])
+            if r_ < 8:
+                continue
+            Tcrop = Tc[m_i : m_i + 1, :, :, :r_]     # (1,Ct,8,r_)
+            icrop = ink[m_i : m_i + 1, :r_].float()  # (1,r_)
+            for g in Wr[pm].unique():
+                sel = pm & (Wr == g)
+                gw = int(g)
+                dx = (self.sw - gw) // 2
+                if dx < 0:
+                    continue
+                Tr = F.interpolate(Tcrop, size=(self.sh, gw), mode="bilinear",
+                                   align_corners=False)
+                Tr = F.normalize(Tr, dim=1)
+                ikr = (F.interpolate(icrop.view(1, 1, 1, r_), size=(1, gw),
+                                     mode="bilinear", align_corners=False)
+                       .view(1, gw) > 0.5).float()
+                Ps = int(sel.sum())
+                cols = torch.arange(gw, device=dev).view(1, gw) + dx
+                # 注意 expand 通道维必须显式：-1 保持 1 会只采第 0 通道，
+                # 梯度被中心化雅可比湮灭（v4.3 冒烟期已排掉的雷）
+                win = torch.gather(S[si[sel]], 3,
+                                   cols.view(1, 1, 1, gw).expand(Ps, S.shape[1], self.sh, gw))
+                v = (win * Tr).sum((1, 2)) / self.sh  # (Ps,gw) GT 对齐处逐列余弦
+                pull = F.relu(0.85 - v) * ikr
+                loss_sum = loss_sum + pull.sum()
+                col_cnt += int(ikr.sum()) * Ps
+        return loss_sum / max(col_cnt, 1)
+
 
 def pair_grid(m, n, device):
     """m×n 全配对下标（评估用）：返回 (mask_idx, strip_idx)，行主序 reshape(m,n) 可还原。"""

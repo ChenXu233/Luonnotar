@@ -74,7 +74,7 @@ model:
   in_size: 416
   widths: [24, 48, 96, 160]
   neck_ch: 96
-  tpl_ch: 32
+  tpl_ch: 64
   reg_max: 24
   strides: [4, 8, 16]
   assign: height
@@ -86,7 +86,7 @@ train:
   epochs: 25
   eval_every: 5
   eval_n: 300
-  batch_size: 16
+  batch_size: 8
   workers: 6
   lr: 0.001
   weight_decay: 0.0005
@@ -98,6 +98,8 @@ train:
     reg_weight: 2.0
     ang_weight: 0.5
     pair_weight: 1.0
+    pair_pos_weight: 4.0  # 正负 1:8 失衡补偿
+    aux_weight: 0.0  # v4.3 纯上拉致坍塌，停用留档
 
 eval:
   score_threshold: 0.5
